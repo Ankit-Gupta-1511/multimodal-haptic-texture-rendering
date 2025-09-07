@@ -6,7 +6,7 @@ import math
 import time
 import json
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 import numpy as np
 import torch
@@ -125,6 +125,23 @@ def eval_metrics(mode: str, batch: Dict[str, torch.Tensor], out) -> Dict[str, fl
     return mets
 
 
+def _epoch_debug_plots(debug_dir: Path, ep: int, mode: str, batch: Dict[str, torch.Tensor], out) -> None:
+    """Save quick overlays of prediction vs target for vib (and audio)."""
+    from .utils import plot_time_series, numpyify
+    ensure_dir(debug_dir)
+    vib_hat = out[0] if isinstance(out, (tuple, list)) else out
+    vib = batch["vib"]
+    y_hat = numpyify(vib_hat[:1].squeeze(0))
+    y = numpyify(vib[:1].squeeze(0))
+    plot_time_series(debug_dir / f"vib_ep{ep:03d}.png", {"y": y, "y_hat": y_hat}, sr=1000, title=f"vib ep{ep}")
+    if mode == "multitask_av":
+        aud_hat = out[1]
+        aud = batch["audio"]
+        a_hat = numpyify(aud_hat[:1].squeeze(0))
+        a = numpyify(aud[:1].squeeze(0))
+        plot_time_series(debug_dir / f"audio_ep{ep:03d}.png", {"y": a, "y_hat": a_hat}, sr=8000, title=f"audio ep{ep}")
+
+
 def train_loop(args) -> int:
     console = Console()
     params = load_params(Path(args.params))
@@ -170,6 +187,8 @@ def train_loop(args) -> int:
 
     step = 0
     no_improve = 0
+    # Collect metrics per epoch for later saving
+    history: List[Dict[str, float]] = []
 
     with Progress() as progress:
         task = progress.add_task("train", total=epochs * max(1, len(dl_train)))
@@ -210,6 +229,8 @@ def train_loop(args) -> int:
             net.eval()
             val_losses = []
             val_mets = []
+            sample_batch = None
+            sample_out = None
             with torch.no_grad():
                 for j, vb in enumerate(dl_val):
                     vb = to_device(vb, device)
@@ -221,6 +242,9 @@ def train_loop(args) -> int:
                     mets = eval_metrics(mode, vb, vout)
                     val_losses.append(float(vlosses["total"].detach().cpu()))
                     val_mets.append(mets["lsd_vib"])  # early stop on spectral loss
+                    if sample_batch is None:
+                        sample_batch = vb
+                        sample_out = vout
 
             val_loss = float(np.mean(val_losses)) if len(val_losses) else float("inf")
             val_spec = float(np.mean(val_mets)) if len(val_mets) else float("inf")
@@ -228,6 +252,14 @@ def train_loop(args) -> int:
             writer.add_scalar("val/lsd_vib", val_spec, ep)
 
             console.log({"epoch": ep, "val_loss": val_loss, "val_lsd_vib": val_spec})
+
+            # Save per-epoch metrics and quick plots
+            history.append({"epoch": ep, "val_loss": val_loss, "val_lsd_vib": val_spec})
+            try:
+                if sample_batch is not None and sample_out is not None:
+                    _epoch_debug_plots(debug_dir, ep, mode, sample_batch, sample_out)
+            except Exception as ex:
+                console.log(f"warn: failed writing debug plots: {ex}")
 
             improved = val_spec < best_val
             if improved:
@@ -249,7 +281,71 @@ def train_loop(args) -> int:
 
     writer.close()
     console.log(f"Best val spectral loss: {best_val}")
+    # Persist metrics history
+    try:
+        out_json = debug_dir / "metrics_train.json"
+        ensure_dir(out_json.parent)
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+        console.log(f"Saved metrics history to {out_json}")
+    except Exception as ex:
+        console.log(f"warn: could not write metrics history: {ex}")
     return 0
+
+
+@torch.no_grad()
+def test_once(data_path: str, mode: str, ckpt_path: Path, params: Dict[str, Any], out_dir: Path) -> Dict[str, float]:
+    """Evaluate on test split and save metrics to JSON with debug plots."""
+    console = Console()
+    ensure_dir(out_dir)
+    # dataset
+    use_prev = mode == "low_delay_vibro" or (mode == "multitask_av" and params.get("model", {}).get("use_prev", False))
+    use_audio = mode == "multitask_av"
+    ds_test = VisuoTactileDataset(
+        parquet_or_h5_path=data_path,
+        split="test",
+        fs_vib=int(params.get("fs_vib", 1000)),
+        fs_aud=int(params.get("fs_aud", 8000)),
+        win_ms=int(params.get("win_ms", 100)),
+        hop_ratio=float(params.get("hop_ratio", 0.5)),
+        patch=int(params.get("patch", 96)) if params.get("patch") else 96,
+        band_vib=tuple(params.get("band_vib", [20, 400])),
+        use_audio=use_audio,
+        use_prev=use_prev,
+    )
+    dl_test = DataLoader(ds_test, batch_size=int(params["train"]["batch"]), shuffle=False, num_workers=int(params["train"]["workers"]), pin_memory=True)
+    # model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = build_model(mode, params).to(device).eval()
+    state = torch.load(ckpt_path, map_location=device)
+    net.load_state_dict(state["model"])
+
+    # loop
+    losses = []
+    mets = []
+    for i, b in enumerate(dl_test):
+        b = to_device(b, device)
+        out = net(b["patch"], b["state"], b.get("prev_vib"))
+        L = compute_losses(mode, b, out, params)
+        M = eval_metrics(mode, b, out)
+        losses.append(float(L["total"].detach().cpu()))
+        mets.append(M)
+        if i == 0:
+            try:
+                _epoch_debug_plots(out_dir, 999, mode, b, out)  # 999 denotes test
+            except Exception as ex:
+                console.log(f"warn: test debug plot failed: {ex}")
+    # aggregate
+    agg = {"loss": float(np.mean(losses)) if losses else float("inf")}
+    keys = set().union(*(m.keys() for m in mets)) if mets else set()
+    for k in keys:
+        agg[k] = float(np.mean([m[k] for m in mets if k in m]))
+    # write
+    out_json = out_dir / "metrics_test.json"
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(agg, f, indent=2)
+    console.log({"test_metrics": agg, "path": str(out_json)})
+    return agg
 
 
 def main():
@@ -260,10 +356,20 @@ def main():
     p.add_argument("--params", type=str, default="params.yaml")
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--sanity_check", type=int, default=0, help="If >0, run short train/val to emit artifacts")
+    p.add_argument("--test_after", action="store_true", help="Run test on 'test' split after training using best ckpt")
+    p.add_argument("--test_only", action="store_true", help="Only run test; requires --ckpt")
+    p.add_argument("--ckpt", type=str, default="assets/ckpt/best.pt", help="Checkpoint path for test")
     args = p.parse_args()
-    sys.exit(train_loop(args))
+    if args.test_only:
+        params = load_params(Path(args.params))
+        test_once(args.data, args.mode or params.get("mode", "baseline_vibro"), Path(args.ckpt), params, Path(params["logs"]["debug_dir"]).joinpath("test"))
+        return
+    code = train_loop(args)
+    if args.test_after:
+        params = load_params(Path(args.params))
+        test_once(args.data, args.mode or params.get("mode", "baseline_vibro"), Path(args.ckpt), params, Path(params["logs"]["debug_dir"]).joinpath("test"))
+    sys.exit(code)
 
 
 if __name__ == "__main__":
     main()
-

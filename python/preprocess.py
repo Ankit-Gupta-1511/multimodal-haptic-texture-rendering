@@ -18,11 +18,10 @@ from __future__ import annotations
 import os
 import sys
 import json
-import math
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -31,7 +30,7 @@ from PIL import Image
 import h5py
 import scipy.signal as signal
 from scipy.interpolate import interp1d
-from scipy.signal import butter, sosfiltfilt, resample_poly, welch
+from scipy.signal import butter, sosfiltfilt, resample_poly
 
 try:
     from .utils import ensure_dir, make_grid_save, plot_hist, plot_psd
@@ -40,28 +39,6 @@ except Exception:  # pragma: no cover - fallback when run as top-level script
 
 
 # ----------------------------- I/O helpers -----------------------------
-
-def _find_table_in_dir(root: Path) -> Optional[Path]:
-    for ext in (".parquet", ".pq", ".csv", ".h5", ".hdf5"):
-        cand = list(root.rglob(f"*{ext}"))
-        if cand:
-            return cand[0]
-    return None
-
-
-def _read_raw_table(path: Path) -> pd.DataFrame:
-    if path.is_dir():
-        inner = _find_table_in_dir(path)
-        if inner is None:
-            raise FileNotFoundError(f"No raw table found under directory: {path}")
-        path = inner
-    if path.suffix.lower() in {".parquet", ".pq"}:
-        return pd.read_parquet(path)
-    if path.suffix.lower() == ".csv":
-        return pd.read_csv(path)
-    if path.suffix.lower() in {".h5", ".hdf5"}:
-        return pd.read_hdf(path)
-    raise ValueError(f"Unsupported raw table format: {path}")
 
 
 # ------------------------- HAVdb integration (embedded) -----------------
@@ -211,11 +188,14 @@ def _choose_texture_image(img_root: Path, texture: str) -> Optional[Path]:
     for cand in [
         img_root / "img" / texture / f"{texture}_l_0.jpg",
         img_root / "img" / texture / f"{texture}_r_0.jpg",
+        img_root / "img" / texture / f"{texture}_0.jpg",
+        img_root / texture / f"{texture}_l_0.jpg",
+        img_root / texture / f"{texture}_r_0.jpg",
     ]:
         if cand.is_file():
             return cand
     # any image inside the texture folder
-    for folder in [img_root / "img" / texture, img_root / texture, img_root]:
+    for folder in [img_root / "img" / texture, img_root / texture, img_root / "img", img_root]:
         if folder.is_dir():
             imgs = sorted(list(folder.glob("*.jpg")) + list(folder.glob("*.png")))
             if imgs:
@@ -237,43 +217,10 @@ def _choose_texture_image(img_root: Path, texture: str) -> Optional[Path]:
     return None
 
 
-def _load_numeric_array(x: Any, key: str) -> Optional[np.ndarray]:
-    """Return float32 numpy array or None. Accepts:
-    - list/tuple/np.ndarray
-    - JSON stringified list
-    - path to .npy or .csv (single column or comma-separated)
-    - path to .wav for audio
-    """
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return None
-    if isinstance(x, (list, tuple)):
-        return np.asarray(x, dtype=np.float32)
-    if isinstance(x, np.ndarray):
-        return x.astype(np.float32)
-    s = str(x)
-    if s.strip().startswith("[") and s.strip().endswith("]"):
-        try:
-            return np.asarray(json.loads(s), dtype=np.float32)
-        except Exception:
-            pass
-    p = Path(s)
-    if p.suffix.lower() == ".npy" and p.exists():
-        return np.load(p).astype(np.float32)
-    if p.suffix.lower() == ".csv" and p.exists():
-        try:
-            arr = np.loadtxt(p, delimiter=",")
-        except Exception:
-            arr = np.loadtxt(p)
-        return np.asarray(arr, dtype=np.float32)
-    if p.suffix.lower() in {".wav", ".wave"} and p.exists():
-        import soundfile as sf
-        y, _sr = sf.read(p)
-        return np.asarray(y, dtype=np.float32)
-    return None
+# (no generic array loaders necessary for fixed HAVdb structure)
 
 
-def _mel(value: float, hz: bool = True) -> float:
-    return 2595.0 * math.log10(1.0 + value / 700.0) if hz else 700.0 * (10 ** (value / 2595.0) - 1.0)
+# (no mel utilities required in preprocessing)
 
 
 # ---------------------------- Signal helpers ---------------------------
@@ -358,16 +305,15 @@ def preprocess(cfg: PreCfg) -> int:
     ensure_dir(cfg.out_path.parent)
     ensure_dir(cfg.debug_dir)
 
-    # Decide input mode (HAVdb scan vs. table)
+    # Prepare scan roots aligned to your dataset layout
     rows: List[Dict[str, Any]] = []
     uv_fallbacks = 0
     total_windows = 0
-    h5_list = _scan_havdb_h5(cfg.raw_path) if cfg.raw_path.is_dir() else []
-    using_havdb = len(h5_list) > 0
-    if not using_havdb:
-        df_raw = _read_raw_table(cfg.raw_path)
-        if "texture_id" not in df_raw.columns or "image_path" not in df_raw.columns:
-            raise ValueError("Raw table must contain at least 'texture_id' and 'image_path' columns")
+    raw = cfg.raw_path
+    h5_scan_root = raw / "datah5" if (raw / "datah5").exists() else raw
+    h5_list = _scan_havdb_h5(h5_scan_root) if h5_scan_root.exists() else []
+    if not h5_list:
+        raise FileNotFoundError(f"No .h5 recordings found under {h5_scan_root}")
 
     # Stats accumulators
     patch_sum = 0.0
@@ -385,231 +331,99 @@ def preprocess(cfg: PreCfg) -> int:
     hop_v = int(max(1, round(win_v * cfg.hop_ratio)))
     sos = _butter_bandpass_sos(cfg.band_vib[0], cfg.band_vib[1], fs_v)
 
-    if using_havdb:
-        # Image roots to search
-        candidate_img_roots = [cfg.raw_path / "img", cfg.raw_path.parent / "img", cfg.raw_path]
-        common_sr = max(fs_v, fs_a)
-        for rec in h5_list:
-            user = rec["user"]; tex_id = rec["texture"]; trial = rec["trial"]
-            h5_path = rec["h5_path"]
-            # base path containing user folders
-            local_root = h5_path.parents[2] if len(h5_path.parents) >= 2 else cfg.raw_path
-            try:
-                data, _ = hav_load_data(str(local_root), user, tex_id, trial, sampling_rate=common_sr)
-            except Exception as ex:
-                warnings.warn(f"HAVdb load failed for {h5_path}: {ex}")
-                continue
-            common_time, position, speed, direction, vibration, audio, force, torque = data
-            vib_ch = vibration[:, 0].astype(np.float32)
-            aud_ch = audio[:, 0].astype(np.float32) if isinstance(audio, np.ndarray) and audio.size else None
-            # resample to target rates
-            vib_rs = resample_poly(vib_ch, fs_v, common_sr) if common_sr != fs_v else vib_ch
-            if aud_ch is not None:
-                aud_rs = resample_poly(aud_ch, fs_a, common_sr) if common_sr != fs_a else aud_ch
-            else:
-                aud_rs = None
-            # vib preprocessing
-            vib_rs = vib_rs - float(np.mean(vib_rs))
-            try:
-                vib_rs = sosfiltfilt(sos, vib_rs).astype(np.float32)
-            except Exception:
-                pass
-            # states
-            sp = speed.squeeze().astype(np.float32)
-            if sp.ndim > 1:
-                sp = sp[:, 0]
-            sp_rs = resample_poly(sp, fs_v, common_sr) if common_sr != fs_v else sp
-            if isinstance(force, np.ndarray) and force.ndim == 2 and force.shape[1] >= 3:
-                fo_mag = np.linalg.norm(force[:, :3], axis=1).astype(np.float32)
-            else:
-                fo_mag = np.asarray(force).squeeze().astype(np.float32)
-            fo_rs = resample_poly(fo_mag, fs_v, common_sr) if common_sr != fs_v else fo_mag
-            # select texture image
-            img_path = None
-            for base in candidate_img_roots:
-                img_path = _choose_texture_image(base, tex_id)
-                if img_path is not None:
-                    break
-            if img_path is None:
-                warnings.warn(f"No texture image found for {tex_id} near {cfg.raw_path}")
-                continue
-            # windows over vib
-            win_idx = _window_indices(len(vib_rs), win_v, hop_v)
-            for wj, (s, e) in enumerate(win_idx):
-                total_windows += 1
-                sp_m = float(np.mean(sp_rs[s:e])) if e <= len(sp_rs) else 0.0
-                fo_m = float(np.mean(fo_rs[s:e])) if e <= len(fo_rs) else 0.0
-                if sp_m <= float(cfg.speed_thresh):
-                    continue
-                v_win = vib_rs[s:e].astype(np.float32)
-                if len(v_win) != win_v:
-                    continue
-                v_win = (v_win - float(np.mean(v_win))).astype(np.float32)
-                vib_sq_acc += float(np.sum(np.square(v_win)))
-                vib_count += len(v_win)
-                # previous
-                pv_win = None
-                ps, pe = s - win_v, s
-                if ps >= 0:
-                    pv_win = vib_rs[ps:pe].astype(np.float32)
-                    pv_win = (pv_win - float(np.mean(pv_win))).astype(np.float32)
-                # audio align
-                a_win = None
-                if aud_rs is not None:
-                    s_a = int(round(s * (fs_a / fs_v)))
-                    e_a = s_a + win_a
-                    if e_a <= len(aud_rs):
-                        a_win = aud_rs[s_a:e_a].astype(np.float32)
-                        # target RMS -12 dBFS
-                        target_rms = 10 ** (-12 / 20)
-                        cur = _rms(a_win)
-                        if cur > 1e-9:
-                            a_win = (a_win * (target_rms / cur)).astype(np.float32)
-                        a_win = np.clip(a_win, -1.0, 1.0)
-                # pseudo UV
-                u_c, v_c = _pseudo_uv(tex_id, wj)
-                uv_fallbacks += 1
-                # patch stats
-                try:
-                    patch_arr = _crop_wrap_gray(img_path, u_c, v_c, cfg.patch)
-                    patch_sum += float(np.sum(patch_arr))
-                    patch_sq_sum += float(np.sum(patch_arr ** 2))
-                    patch_count += patch_arr.size
-                except Exception:
-                    pass
-                speeds_all.append(sp_m)
-                forces_all.append(fo_m)
-                rows.append({
-                    "texture_id": tex_id,
-                    "image_path": str(img_path),
-                    "window_index": int(wj),
-                    "u": u_c,
-                    "v": v_c,
-                    "speed_mean": sp_m,
-                    "force_mean": fo_m,
-                    "vib": v_win.tolist(),
-                    "prev_vib": pv_win.tolist() if pv_win is not None else None,
-                    "audio": a_win.tolist() if a_win is not None else None,
-                    "fs_vib": fs_v,
-                    "fs_aud": fs_a,
-                })
-    else:
-        for ridx, row in df_raw.iterrows():
-        tex_id = row.get("texture_id")
-        img_path = Path(str(row.get("image_path")))
-        if not img_path.exists():
-            warnings.warn(f"Image not found for texture_id={tex_id}: {img_path}")
-            continue
-
-        # Load raw arrays (any reasonable naming)
-        vib = _load_numeric_array(row.get("accel"), "accel") or _load_numeric_array(row.get("accel_signal"), "accel_signal") or _load_numeric_array(row.get("accel_signal_path"), "accel_signal_path") or _load_numeric_array(row.get("accel_path"), "accel_path")
-        if vib is None:
-            warnings.warn(f"Missing vibration for texture_id={tex_id}")
-            continue
-        vib_sr = int(row.get("accel_sr", fs_v))
-        vib = resample_poly(vib, fs_v, vib_sr) if vib_sr != fs_v else vib
-        vib = vib.astype(np.float32)
-        vib = vib - float(np.mean(vib))
+    # Image roots to search
+    candidate_img_roots = [raw / "img" / "img", raw / "img", raw.parent / "img" / "img", raw.parent / "img"]
+    common_sr = max(fs_v, fs_a)
+    for rec in h5_list:
+        user = rec["user"]; tex_id = rec["texture"]; trial = rec["trial"]
+        h5_path = rec["h5_path"]
+        # base path containing user folders
+        local_root = h5_path.parents[2] if len(h5_path.parents) >= 2 else raw
         try:
-            vib = sosfiltfilt(sos, vib).astype(np.float32)
+            data, _ = hav_load_data(str(local_root), user, tex_id, trial, sampling_rate=common_sr)
+        except Exception as ex:
+            warnings.warn(f"HAVdb load failed for {h5_path}: {ex}")
+            continue
+        common_time, position, speed, direction, vibration, audio, force, torque = data
+        vib_ch = vibration[:, 0].astype(np.float32)
+        aud_ch = audio[:, 0].astype(np.float32) if isinstance(audio, np.ndarray) and audio.size else None
+        # resample to target rates
+        vib_rs = resample_poly(vib_ch, fs_v, common_sr) if common_sr != fs_v else vib_ch
+        if aud_ch is not None:
+            aud_rs = resample_poly(aud_ch, fs_a, common_sr) if common_sr != fs_a else aud_ch
+        else:
+            aud_rs = None
+        # vib preprocessing
+        vib_rs = vib_rs - float(np.mean(vib_rs))
+        try:
+            vib_rs = sosfiltfilt(sos, vib_rs).astype(np.float32)
         except Exception:
-            # If SciPy stability issues on very short input, skip filtering
             pass
-
-        # Audio (optional)
-        audio = _load_numeric_array(row.get("audio"), "audio") or _load_numeric_array(row.get("audio_path"), "audio_path")
-        aud_sr = int(row.get("audio_sr", fs_a))
-        if audio is not None and len(audio) >= 8:
-            audio = resample_poly(audio, fs_a, aud_sr) if aud_sr != fs_a else audio.astype(np.float32)
-            # Target -12 dBFS RMS
-            target_rms = 10 ** (-12 / 20)
-            cur = _rms(audio)
-            if cur > 1e-9:
-                audio = (audio * (target_rms / cur)).astype(np.float32)
-            audio = np.clip(audio, -1.0, 1.0)
+        # states
+        sp = speed.squeeze().astype(np.float32)
+        if sp.ndim > 1:
+            sp = sp[:, 0]
+        sp_rs = resample_poly(sp, fs_v, common_sr) if common_sr != fs_v else sp
+        if isinstance(force, np.ndarray) and force.ndim == 2 and force.shape[1] >= 3:
+            fo_mag = np.linalg.norm(force[:, :3], axis=1).astype(np.float32)
         else:
-            audio = None
-
-        # Speed/force: accept array or scalar; if missing use zeros
-        speed_arr = _load_numeric_array(row.get("speed"), "speed") or _load_numeric_array(row.get("speed_path"), "speed_path")
-        force_arr = _load_numeric_array(row.get("normal_force"), "normal_force") or _load_numeric_array(row.get("force"), "force") or _load_numeric_array(row.get("force_path"), "force_path")
-        sp_sr = int(row.get("speed_sr", fs_v))
-        fo_sr = int(row.get("force_sr", fs_v))
-        if speed_arr is None:
-            speed_arr = np.full_like(vib, fill_value=float(row.get("speed", 0.0)), dtype=np.float32)
-        else:
-            speed_arr = resample_poly(speed_arr, fs_v, sp_sr) if sp_sr != fs_v else speed_arr.astype(np.float32)
-        if force_arr is None:
-            force_arr = np.full_like(vib, fill_value=float(row.get("normal_force", 0.0)), dtype=np.float32)
-        else:
-            force_arr = resample_poly(force_arr, fs_v, fo_sr) if fo_sr != fs_v else force_arr.astype(np.float32)
-
-        # UV per-sample optional
-        uv = _load_numeric_array(row.get("uv"), "uv") or _load_numeric_array(row.get("uv_path"), "uv_path")
-        if uv is not None:
-            uv = np.asarray(uv, dtype=np.float32).reshape(-1, 2)
-            if len(uv) != len(vib):
-                # resample UV by indexing proportionally
-                idx = np.linspace(0, len(uv) - 1, num=len(vib))
-                uv = np.stack([
-                    np.interp(idx, np.arange(len(uv)), uv[:, 0]),
-                    np.interp(idx, np.arange(len(uv)), uv[:, 1]),
-                ], axis=1).astype(np.float32)
-
-        # Windowing & thresholds
-        win_idx = _window_indices(len(vib), win_v, hop_v)
+            fo_mag = np.asarray(force).squeeze().astype(np.float32)
+        fo_rs = resample_poly(fo_mag, fs_v, common_sr) if common_sr != fs_v else fo_mag
+        # select texture image
+        img_path = None
+        for base in candidate_img_roots:
+            img_path = _choose_texture_image(base, tex_id)
+            if img_path is not None:
+                break
+        if img_path is None:
+            warnings.warn(f"No texture image found for {tex_id} near {raw}")
+            continue
+        # windows over vib
+        win_idx = _window_indices(len(vib_rs), win_v, hop_v)
         for wj, (s, e) in enumerate(win_idx):
             total_windows += 1
-            sp_m = float(np.mean(speed_arr[s:e])) if e <= len(speed_arr) else 0.0
-            fo_m = float(np.mean(force_arr[s:e])) if e <= len(force_arr) else 0.0
-            # Sliding detection by threshold
+            sp_m = float(np.mean(sp_rs[s:e])) if e <= len(sp_rs) else 0.0
+            fo_m = float(np.mean(fo_rs[s:e])) if e <= len(fo_rs) else 0.0
             if sp_m <= float(cfg.speed_thresh):
                 continue
-
-            # Vibration window
-            v_win = vib[s:e].astype(np.float32)
+            v_win = vib_rs[s:e].astype(np.float32)
             if len(v_win) != win_v:
                 continue
             v_win = (v_win - float(np.mean(v_win))).astype(np.float32)
             vib_sq_acc += float(np.sum(np.square(v_win)))
             vib_count += len(v_win)
-
-            # Previous window (optional, always stored for convenience)
+            # previous
             pv_win = None
             ps, pe = s - win_v, s
             if ps >= 0:
-                pv_win = vib[ps:pe].astype(np.float32)
+                pv_win = vib_rs[ps:pe].astype(np.float32)
                 pv_win = (pv_win - float(np.mean(pv_win))).astype(np.float32)
-
-            # Audio window
+            # audio align
             a_win = None
-            if audio is not None:
+            if aud_rs is not None:
                 s_a = int(round(s * (fs_a / fs_v)))
                 e_a = s_a + win_a
-                if e_a <= len(audio):
-                    a_win = audio[s_a:e_a].astype(np.float32)
-
-            # UV center per-window
-            if uv is not None and e <= len(uv):
-                u_c = float(np.clip(np.mean(uv[s:e, 0]), 0.0, 1.0))
-                v_c = float(np.clip(np.mean(uv[s:e, 1]), 0.0, 1.0))
-            else:
-                u_c, v_c = _pseudo_uv(tex_id, wj)
-                uv_fallbacks += 1
-
-            # Accumulate patch stats (streamed)
+                if e_a <= len(aud_rs):
+                    a_win = aud_rs[s_a:e_a].astype(np.float32)
+                    # target RMS -12 dBFS
+                    target_rms = 10 ** (-12 / 20)
+                    cur = _rms(a_win)
+                    if cur > 1e-9:
+                        a_win = (a_win * (target_rms / cur)).astype(np.float32)
+                    a_win = np.clip(a_win, -1.0, 1.0)
+            # pseudo UV
+            u_c, v_c = _pseudo_uv(tex_id, wj)
+            uv_fallbacks += 1
+            # patch stats
             try:
                 patch_arr = _crop_wrap_gray(img_path, u_c, v_c, cfg.patch)
                 patch_sum += float(np.sum(patch_arr))
                 patch_sq_sum += float(np.sum(patch_arr ** 2))
                 patch_count += patch_arr.size
             except Exception:
-                # keep going; dataset will crop again at load time
                 pass
-
             speeds_all.append(sp_m)
             forces_all.append(fo_m)
-
             rows.append({
                 "texture_id": tex_id,
                 "image_path": str(img_path),
