@@ -11,13 +11,13 @@ model:
   use_prev: false
 train:
   epochs: 100
-  batch: 128
+  batch: 8
   lr: 1e-3
   weight_decay: 0.01
   amp: true
   grad_clip: 5.0
   early_stop_patience: 12
-  workers: 4
+  workers: 0
   overfit_batches: 0
 loss:
   w_stft_vib: 0.5

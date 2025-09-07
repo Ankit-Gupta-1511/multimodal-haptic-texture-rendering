@@ -20,6 +20,7 @@ import sys
 import json
 import warnings
 from dataclasses import dataclass
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +32,11 @@ import h5py
 import scipy.signal as signal
 from scipy.interpolate import interp1d
 from scipy.signal import butter, sosfiltfilt, resample_poly
+try:
+    from tqdm import tqdm
+except Exception:  # fallback if tqdm not available
+    def tqdm(x, **kwargs):
+        return x
 
 try:
     from .utils import ensure_dir, make_grid_save, plot_hist, plot_psd
@@ -281,6 +287,10 @@ class PreCfg:
     test_textures: int
     patch: int
     debug_dir: Path
+    max_files: int = 0
+    max_windows: int = 0
+    verbose: int = 1
+    progress: int = 1
 
 
 def _split_by_texture(textures: List[Any], val_n: int, test_n: int, seed: int = 1337) -> Dict[Any, str]:
@@ -314,6 +324,16 @@ def preprocess(cfg: PreCfg) -> int:
     h5_list = _scan_havdb_h5(h5_scan_root) if h5_scan_root.exists() else []
     if not h5_list:
         raise FileNotFoundError(f"No .h5 recordings found under {h5_scan_root}")
+    # Sort deterministically and optionally limit for debugging
+    h5_list = sorted(h5_list, key=lambda r: (str(r.get("user")), str(r.get("texture")), str(r.get("trial"))))
+    if cfg.max_files and cfg.max_files > 0:
+        h5_list = h5_list[: cfg.max_files]
+
+    t0 = time.time()
+    print(f"[preprocess] raw={raw} scan_root={h5_scan_root} files_found={len(h5_list)}", flush=True)
+    if cfg.verbose and len(h5_list):
+        for ex in h5_list[:3]:
+            print(f"  sample file: user={ex['user']} texture={ex['texture']} trial={ex['trial']} path={ex['h5_path']}", flush=True)
 
     # Stats accumulators
     patch_sum = 0.0
@@ -334,7 +354,12 @@ def preprocess(cfg: PreCfg) -> int:
     # Image roots to search
     candidate_img_roots = [raw / "img" / "img", raw / "img", raw.parent / "img" / "img", raw.parent / "img"]
     common_sr = max(fs_v, fs_a)
-    for rec in h5_list:
+    files_processed = 0
+    files_failed = 0
+    images_missing = 0
+    iterator = tqdm(h5_list, total=len(h5_list), desc="[preprocess] files", disable=not bool(cfg.progress))
+    for rec in iterator:
+        file_t0 = time.time()
         user = rec["user"]; tex_id = rec["texture"]; trial = rec["trial"]
         h5_path = rec["h5_path"]
         # base path containing user folders
@@ -343,6 +368,7 @@ def preprocess(cfg: PreCfg) -> int:
             data, _ = hav_load_data(str(local_root), user, tex_id, trial, sampling_rate=common_sr)
         except Exception as ex:
             warnings.warn(f"HAVdb load failed for {h5_path}: {ex}")
+            files_failed += 1
             continue
         common_time, position, speed, direction, vibration, audio, force, torque = data
         vib_ch = vibration[:, 0].astype(np.float32)
@@ -377,9 +403,11 @@ def preprocess(cfg: PreCfg) -> int:
                 break
         if img_path is None:
             warnings.warn(f"No texture image found for {tex_id} near {raw}")
+            images_missing += 1
             continue
         # windows over vib
         win_idx = _window_indices(len(vib_rs), win_v, hop_v)
+        kept_in_file = 0
         for wj, (s, e) in enumerate(win_idx):
             total_windows += 1
             sp_m = float(np.mean(sp_rs[s:e])) if e <= len(sp_rs) else 0.0
@@ -438,6 +466,16 @@ def preprocess(cfg: PreCfg) -> int:
                 "fs_vib": fs_v,
                 "fs_aud": fs_a,
             })
+            kept_in_file += 1
+            if cfg.max_windows and len(rows) >= cfg.max_windows:
+                print(f"[preprocess] Reached max_windows={cfg.max_windows}; early stopping.", flush=True)
+                break
+        files_processed += 1
+        if cfg.verbose:
+            dt = time.time() - file_t0
+            print(f"[preprocess] done user={user} texture={tex_id} trial={trial} kept={kept_in_file} dt={dt:.2f}s", flush=True)
+        if cfg.max_windows and len(rows) >= cfg.max_windows:
+            break
 
     if not rows:
         raise RuntimeError("No windows produced. Check speed threshold, raw signals, and timing alignment.")
@@ -513,7 +551,7 @@ def preprocess(cfg: PreCfg) -> int:
         plot_psd(dbg / "audio_psd.png", aud_cat, sr=fs_a, title="audio PSD")
 
     # Print dataset stats to stdout
-    print(json.dumps({
+    summary = {
         "rows": len(rows),
         "split_counts": {k: int(v) for k, v in dict(df_out["split"].value_counts()).items()},
         "textures": int(len(set(df_out["texture_id"]))),
@@ -524,7 +562,18 @@ def preprocess(cfg: PreCfg) -> int:
         "parquet": str(cfg.out_path),
         "norm_yaml": str(norm_path),
         "debug_dir": str(cfg.debug_dir),
-    }, indent=2))
+        "files_processed": files_processed,
+        "files_failed": files_failed,
+        "images_missing": images_missing,
+        "scan_root": str(h5_scan_root),
+        "elapsed_sec": float(time.time() - t0),
+    }
+    print(json.dumps(summary, indent=2), flush=True)
+    try:
+        with open(Path(cfg.debug_dir) / "preprocess_summary.json", "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+    except Exception:
+        pass
 
     return 0
 
@@ -551,6 +600,10 @@ def main():
     p.add_argument("--test_textures", type=int, default=2)
     p.add_argument("--patch", type=int, default=96)
     p.add_argument("--debug_dir", type=str, default="assets/debug_samples")
+    p.add_argument("--max_files", type=int, default=0, help="Limit number of H5 files for debugging")
+    p.add_argument("--max_windows", type=int, default=0, help="Limit number of windows for debugging")
+    p.add_argument("--verbose", type=int, default=1, help="Verbosity level (0=silent,1=info)")
+    p.add_argument("--progress", type=int, default=1, help="Show progress bar (1=yes,0=no)")
     args = p.parse_args()
 
     cfg = PreCfg(
@@ -567,6 +620,10 @@ def main():
         test_textures=int(args.test_textures),
         patch=int(args.patch),
         debug_dir=Path(args.debug_dir),
+        max_files=int(args.max_files),
+        max_windows=int(args.max_windows),
+        verbose=int(args.verbose),
+        progress=int(args.progress),
     )
     sys.exit(preprocess(cfg))
 

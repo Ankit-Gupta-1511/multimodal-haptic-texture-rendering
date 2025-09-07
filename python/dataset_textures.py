@@ -194,7 +194,8 @@ class VisuoTactileDataset(Dataset):
         self.force_max = float(norm.get("force_max", 1.0))
         self.vib_rms = float(norm.get("vib_rms", 1.0))
 
-        df = _read_table(self.path)
+        df_all = _read_table(self.path)
+        df = df_all.copy()
         if "split" not in df.columns:
             warnings.warn("Dataset has no 'split' column; defaulting to hash-based 80/10/10 split")
             def _split_of(row):
@@ -202,10 +203,21 @@ class VisuoTactileDataset(Dataset):
                 h = abs(hash(key)) % 10
                 return "train" if h < 8 else ("val" if h < 9 else "test")
             df["split"] = df.apply(_split_of, axis=1)
-        df = df[df["split"].astype(str) == self.split].reset_index(drop=True)
-        if len(df) == 0:
-            raise RuntimeError(f"No rows for split={self.split} in {self.path}")
-        self.df = df
+        df_split = df[df["split"].astype(str) == self.split].reset_index(drop=True)
+        if len(df_split) == 0:
+            warnings.warn(
+                f"No rows for split={self.split} in {self.path}. Falling back to hash-based split.")
+            def _split_fb(row):
+                key = str(row.get("texture_id", row.get("image_path", "")))
+                h = abs(hash(key)) % 10
+                return "train" if h < 8 else ("val" if h < 9 else "test")
+            df_fb = df_all.copy()
+            df_fb["split"] = df_fb.apply(_split_fb, axis=1)
+            df_split = df_fb[df_fb["split"].astype(str) == self.split].reset_index(drop=True)
+            if len(df_split) == 0:
+                raise RuntimeError(
+                    f"No rows for split={self.split} even after fallback split. Re-run preprocessing with fewer val/test textures or lower speed_thresh.")
+        self.df = df_split
         self._fallback_uv_count = 0
         self._total_uv = len(df)
 
