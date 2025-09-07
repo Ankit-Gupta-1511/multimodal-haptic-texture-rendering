@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Data and figures
+datah5/
+img/
+figs/
+*.zip
+*.h5
+*.jpg
+*.png
+
+# VS Code
+.vscode/
+
+# Environment files
+.env
+*.env
+
+# OS files
+.DS_Store
+Thumbs.db
+*Zone.Identifier
