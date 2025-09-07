@@ -1,0 +1,30 @@
+mode: baseline_vibro
+fs_vib: 1000
+fs_aud: 8000
+win_ms: 100
+hop_ratio: 0.5
+band_vib: [20, 400]
+model:
+  latent: 128
+  tcn_blocks: 4
+  tcn_growth: 64
+  use_prev: false
+train:
+  epochs: 100
+  batch: 128
+  lr: 1e-3
+  weight_decay: 0.01
+  amp: true
+  grad_clip: 5.0
+  early_stop_patience: 12
+  workers: 4
+  overfit_batches: 0
+loss:
+  w_stft_vib: 0.5
+  w_time_aud: 1.0
+  w_mel_aud: 0.5
+  w_sync: 0.2
+logs:
+  tb_dir: runs
+  debug_dir: assets/debug
+

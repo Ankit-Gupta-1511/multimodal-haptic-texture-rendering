@@ -1,0 +1,31 @@
+name: visuotactile-cpu
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch>=2.2
+  - torchvision>=0.17
+  - torchaudio>=2.2
+  - numpy
+  - scipy
+  - pandas
+  - pyarrow
+  - h5py
+  - pyyaml
+  - tqdm
+  - rich
+  - tensorboard
+  - matplotlib
+  - seaborn
+  - scikit-learn
+  - librosa
+  - soundfile
+  - psutil
+  - einops
+  - torchmetrics
+  - onnx
+  - onnxruntime
+  - pytest
+

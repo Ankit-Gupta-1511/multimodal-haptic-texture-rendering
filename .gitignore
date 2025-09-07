@@ -1,32 +1,52 @@
+# General
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.swp
+*.swo
+
 # Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-*.egg-info/
-dist/
+.venv/
+venv/
+.python-version
+
+# Build artifacts
 build/
+out/
+bin/
+obj/
+dist/
+*.pdb
+*.ilk
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.ipdb
 
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+*.cmake
+Makefile
+cmake_install.cmake
+compile_commands.json
 
-# Data and figures
-datah5/
-img/
-figs/
-*.zip
-*.h5
-*.jpg
-*.png
-
-# VS Code
+# VS / VSCode
+.vs/
 .vscode/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
 
-# Environment files
-.env
-*.env
+# OS-specific
+ehthumbs.db
+Icon?
 
-# OS files
-.DS_Store
-Thumbs.db
-*Zone.Identifier
+data
