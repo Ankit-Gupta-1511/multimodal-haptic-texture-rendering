@@ -256,12 +256,14 @@ class VisuoTactileDataset(Dataset):
             "vib": torch.from_numpy(vib.astype(np.float32)),
         }
 
-        if self.cfg.use_audio and "audio" in row and pd.notna(row["audio"]):
-            aud = _to_numpy_array(row.get("audio", None), "audio").astype(np.float32)
+        aud_val = row.get("audio", None)
+        if self.cfg.use_audio and aud_val is not None and not (isinstance(aud_val, float) and np.isnan(aud_val)):
+            aud = _to_numpy_array(aud_val, "audio").astype(np.float32)
             out["audio"] = torch.from_numpy(aud)
 
-        if self.cfg.use_prev and "prev_vib" in row and pd.notna(row["prev_vib"]):
-            pv = _to_numpy_array(row.get("prev_vib", None), "prev_vib").astype(np.float32)
+        pv_val = row.get("prev_vib", None)
+        if self.cfg.use_prev and pv_val is not None and not (isinstance(pv_val, float) and np.isnan(pv_val)):
+            pv = _to_numpy_array(pv_val, "prev_vib").astype(np.float32)
             out["prev_vib"] = torch.from_numpy(pv)
 
         # Assertions with helpful messages

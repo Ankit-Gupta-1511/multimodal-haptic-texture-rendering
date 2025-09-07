@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -12,9 +13,18 @@ def rmse_torch(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def lsd_torch(y_hat: torch.Tensor, y: torch.Tensor, n_fft: int = 256, hop: int = 64, eps: float = 1e-8) -> torch.Tensor:
-    window = torch.hann_window(n_fft, device=y.device)
-    def spec_db(x):
-        X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=n_fft, window=window, return_complex=True)
+    """Log-spectral distance with adaptive STFT for short sequences."""
+    def spec_db(x: torch.Tensor) -> torch.Tensor:
+        T = int(x.shape[-1])
+        t_eff = max(4, T)
+        # nearest power of 2 <= t_eff
+        pow2 = 2 ** int(math.floor(math.log2(t_eff))) if t_eff >= 4 else 4
+        n_fft_eff = min(n_fft, pow2)
+        win_eff = min(n_fft_eff, t_eff)
+        hop_eff = max(1, min(hop, max(1, win_eff // 2)))
+        center = T >= win_eff
+        window = torch.hann_window(win_eff, device=x.device)
+        X = torch.stft(x, n_fft=n_fft_eff, hop_length=hop_eff, win_length=win_eff, window=window, return_complex=True, center=center)
         mag = torch.abs(X) + eps
         db = 20.0 * torch.log10(mag)
         return db.transpose(1, 2)
@@ -86,4 +96,3 @@ def envelope_corr_np(y_hat: np.ndarray, y: np.ndarray, sr: int = 1000, win_ms: f
     if np.std(e1) < 1e-6 or np.std(e2) < 1e-6:
         return 0.0
     return float(np.corrcoef(e1, e2)[0, 1])
-

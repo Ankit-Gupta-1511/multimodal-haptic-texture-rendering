@@ -11,8 +11,19 @@ def time_mse(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def _stft_mag(y: torch.Tensor, n_fft: int = 256, hop: int = 64, win_length: int = 256) -> torch.Tensor:
-    window = torch.hann_window(win_length, device=y.device)
-    Y = torch.stft(y, n_fft=n_fft, hop_length=hop, win_length=win_length, window=window, return_complex=True)
+    """Adaptive STFT magnitude to handle short signals.
+
+    Clamps FFT and window sizes to fit the time length to avoid padding errors
+    on very short inputs (e.g., vib length=100 samples).
+    """
+    T = y.shape[-1]
+    # choose effective sizes compatible with T
+    n_fft_eff = min(n_fft, max(4, 2 ** int(math.floor(math.log2(max(4, T))))))
+    win_eff = min(win_length, n_fft_eff, T)
+    hop_eff = max(1, min(hop, max(1, win_eff // 2)))
+    center = T >= win_eff
+    window = torch.hann_window(win_eff, device=y.device)
+    Y = torch.stft(y, n_fft=n_fft_eff, hop_length=hop_eff, win_length=win_eff, window=window, return_complex=True, center=center)
     mag = torch.abs(Y) + 1e-8
     return mag
 
@@ -98,4 +109,3 @@ def envelope_sync_loss(vib_hat: torch.Tensor, aud_hat: torch.Tensor, vib_sr: int
     ea = _norm(ea)
     corr = torch.mean((ev * ea).mean(dim=1))
     return 1.0 - corr
-

@@ -317,8 +317,20 @@ def test_once(data_path: str, mode: str, ckpt_path: Path, params: Dict[str, Any]
     # model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = build_model(mode, params).to(device).eval()
-    state = torch.load(ckpt_path, map_location=device)
-    net.load_state_dict(state["model"])
+    # Safer load: prefer weights_only=True when available; fallback otherwise
+    try:
+        state = torch.load(ckpt_path, map_location=device, weights_only=True)  # PyTorch >=2.1
+        if isinstance(state, dict) and any(k.startswith("enc_img") or k.startswith("fuse") for k in state.keys()):
+            net.load_state_dict(state)
+        elif isinstance(state, dict) and "model" in state:
+            net.load_state_dict(state["model"])
+        else:
+            # Unexpected structure, try direct
+            net.load_state_dict(state)
+    except TypeError:
+        # Older PyTorch without weights_only
+        state = torch.load(ckpt_path, map_location=device)
+        net.load_state_dict(state["model"])  # our saved format
 
     # loop
     losses = []
