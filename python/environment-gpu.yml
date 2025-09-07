@@ -23,11 +23,10 @@ dependencies:
   - seaborn
   - scikit-learn
   - librosa
-  - soundfile
+  - pysoundfile        # <-- conda name (instead of 'soundfile')
   - psutil
   - einops
   - torchmetrics
   - onnx
   - onnxruntime
   - pytest
-

@@ -28,6 +28,9 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
+import h5py
+import scipy.signal as signal
+from scipy.interpolate import interp1d
 from scipy.signal import butter, sosfiltfilt, resample_poly, welch
 
 try:
@@ -59,6 +62,179 @@ def _read_raw_table(path: Path) -> pd.DataFrame:
     if path.suffix.lower() in {".h5", ".hdf5"}:
         return pd.read_hdf(path)
     raise ValueError(f"Unsupported raw table format: {path}")
+
+
+# ------------------------- HAVdb integration (embedded) -----------------
+
+def hav_get_data(path: str, user: str, texture: str, trial: str, time_offset: int = -1691745000):
+    """Embedded reader for HAVdb .h5 files.
+
+    Returns: ([time_kistler, kistler_data], [time_pos, pos_data], [time_ft_sensor, ft_sensor_data])
+    """
+    filename = f"{user}_{texture}_{trial}.h5"
+    with h5py.File(Path(path) / user / texture / filename, "r") as f:
+        time_kistler = f["time_kistler"][:] + time_offset
+        kistler_data = f["kistler_data"][:]
+        time_pos = f["time_pos"][:] + time_offset
+        pos_data = f["pos_data"][:]
+        time_ft_sensor = f["time_ft_sensor"][:] + time_offset
+        ft_sensor_data = f["ft_sensor_data"][:]
+    return ([time_kistler, kistler_data], [time_pos, pos_data], [time_ft_sensor, ft_sensor_data])
+
+
+def hav_get_position_features(time: np.ndarray, values: np.ndarray):
+    """Resample position to 50 Hz then 240 Hz, lowpass, compute speed and direction."""
+    # 50 Hz uniform
+    new_time = np.arange(time[0, 0], time[-1, 0], 1 / 50)
+    new_values = np.zeros((new_time.shape[0], values.shape[1]), dtype=np.float64)
+    for k in range(values.shape[1]):
+        new_values[:, k] = interp1d(time[:, 0], values[:, k], axis=0, bounds_error=False, fill_value=0, kind="linear")(new_time)
+    time = np.reshape(new_time, (new_time.shape[0], 1))
+    values = new_values
+    # 240 Hz uniform
+    Fs = 240
+    new_time = np.arange(time[0, 0], time[-1, 0], 1 / Fs)
+    new_values = np.zeros((new_time.shape[0], values.shape[1]), dtype=np.float64)
+    for k in range(values.shape[1]):
+        new_values[:, k] = interp1d(time[:, 0], values[:, k], axis=0, bounds_error=False, fill_value=0, kind="cubic")(new_time)
+    time = np.reshape(new_time, (new_time.shape[0], 1))
+    values = new_values
+    # lowpass 15 Hz
+    fc = 15
+    a, b = signal.butter(10, fc / (Fs / 2), "low")
+    for k in range(values.shape[1]):
+        values[:, k] = signal.filtfilt(a, b, values[:, k])
+    # compute features
+    posX = values[:, 0]
+    posY = values[:, 1]
+    posX2 = values[:, 2]
+    posY2 = values[:, 3]
+    step_distance = np.sqrt(np.diff(posX) ** 2 + np.diff(posY) ** 2)
+    speed = step_distance / (np.diff(time[:, 0]))
+    speed = np.append(speed, speed[-1])
+    position = np.concatenate((posX.reshape(-1, 1), posY.reshape(-1, 1)), axis=1)
+    direction = np.zeros((position.shape[0],), dtype=np.float64)
+    finger_direction = np.zeros((position.shape[0],), dtype=np.float64)
+    nb_turn = 0
+    for i in range(1, position.shape[0] - 1):
+        direction[i] = np.arctan2(posY[i + 1] - posY[i - 1], posX[i + 1] - posX[i - 1]) * 180 / np.pi
+        if direction[i] - (direction[i - 1] - nb_turn * 360) < -320:
+            nb_turn = nb_turn + 1
+        elif direction[i] - (direction[i - 1] - nb_turn * 360) > 320:
+            nb_turn = nb_turn - 1
+        direction[i] = direction[i] + nb_turn * 360
+        dist = np.sqrt((posX2[i] - posX[i]) ** 2 + (posY2[i] - posY[i]) ** 2)
+        if abs(0.150 - dist) < 0.04:
+            finger_direction[i] = np.arctan2(posY2[i] - posY[i], posX2[i] - posX[i]) * 180 / np.pi + 90
+        else:
+            finger_direction[i] = finger_direction[i - 1]
+    direction = direction - finger_direction
+    return [time, position, speed, direction]
+
+
+def hav_get_kistler_features(time: np.ndarray, values: np.ndarray):
+    audio = values[:, 0:2]
+    time_audio = time
+    vibration = values[:, 2:4]
+    time_vibration = time
+    return [time_audio, audio], [time_vibration, vibration]
+
+
+def hav_get_ft_sensor_features(time: np.ndarray, values: np.ndarray):
+    force = values[:, 0:3]
+    time_force = time
+    torque = values[:, 3:6]
+    time_torque = time
+    return [time_force, force], [time_torque, torque]
+
+
+def hav_align_all(list_of_times, list_of_data, sampling_rate: int):
+    time_1d = [t.squeeze() for t in list_of_times]
+    start_time = max([time[0] for time in list_of_times])[0]
+    end_time = min([time[-1] for time in list_of_times])[0]
+    common_time = np.arange(start_time, end_time, 1 / sampling_rate)
+    aligned_data = [interp1d(time, data, axis=0)(common_time) for time, data in zip(time_1d, list_of_data)]
+    return common_time, aligned_data
+
+
+def hav_load_data(path: str, user: str, texture: str, trial: str, sampling_rate: int, time_offset: int = -1691745000):
+    ([time_kistler, kistler_data], [time_pos, pos_data], [time_ft_sensor, ft_sensor_data]) = hav_get_data(path, user, texture, trial, time_offset)
+    [time_pos, pos, spd, dir] = hav_get_position_features(time_pos, pos_data)
+    [time_force, force], [time_torque, torque] = hav_get_ft_sensor_features(time_ft_sensor, ft_sensor_data)
+    [time_audio, mic], [time_vibration, vib] = hav_get_kistler_features(time_kistler, kistler_data)
+    times = [time_pos, time_pos, time_pos, time_vibration, time_audio, time_force, time_torque]
+    datas = [pos, spd, dir, vib, mic, force, torque]
+    time_min = min([time[0] for time in times])
+    times = [time - time_min for time in times]
+    common_time, aligned_data = hav_align_all(times, datas, sampling_rate)
+    time_pos = time_pos[:, 0] - time_pos[0, 0]
+    common_time = common_time[:] - common_time[0]
+    position = aligned_data[0]
+    speed = aligned_data[1]
+    direction = aligned_data[2]
+    vibration = aligned_data[3]
+    audio = aligned_data[4]
+    force = aligned_data[5]
+    torque = aligned_data[6]
+    return [common_time, position, speed, direction, vibration, audio, force, torque], [time_pos, pos, spd, dir]
+
+
+def _scan_havdb_h5(root: Path) -> List[Dict[str, Any]]:
+    """Scan a HAVdb-style directory for h5 recordings.
+
+    Pattern: <root>/**/subject_X/<texture>/<user>_<texture>_<trial>.h5
+    Returns list of dicts: {user, texture, trial, h5_path}
+    """
+    out: List[Dict[str, Any]] = []
+    for p in root.rglob("*.h5"):
+        stem = p.stem
+        # Prefer parent folders for user/texture
+        texture = p.parent.name if p.parent else None
+        user = p.parent.parent.name if p.parent and p.parent.parent else None
+        if not user or not texture:
+            parts = stem.split("_")
+            if len(parts) >= 3:
+                user = parts[0]
+                texture = parts[1]
+        trial = stem
+        if user and texture:
+            pref = f"{user}_{texture}_"
+            if stem.startswith(pref):
+                trial = stem[len(pref):]
+        out.append({"user": user, "texture": texture, "trial": trial, "h5_path": p})
+    return out
+
+
+def _choose_texture_image(img_root: Path, texture: str) -> Optional[Path]:
+    """Pick a representative image for a texture from common subfolders."""
+    # common candidates first
+    for cand in [
+        img_root / "img" / texture / f"{texture}_l_0.jpg",
+        img_root / "img" / texture / f"{texture}_r_0.jpg",
+    ]:
+        if cand.is_file():
+            return cand
+    # any image inside the texture folder
+    for folder in [img_root / "img" / texture, img_root / texture, img_root]:
+        if folder.is_dir():
+            imgs = sorted(list(folder.glob("*.jpg")) + list(folder.glob("*.png")))
+            if imgs:
+                # prefer files starting with texture id
+                for im in imgs:
+                    if im.name.startswith(texture):
+                        return im
+                return imgs[0]
+    # search broadly but limit to first match
+    for sub in [img_root, img_root / "img", img_root / "images", img_root / "textures"]:
+        if not sub.exists():
+            continue
+        for cand in sub.rglob("*.jpg"):
+            if cand.parent.name == texture or cand.name.startswith(texture):
+                return cand
+        for cand in sub.rglob("*.png"):
+            if cand.parent.name == texture or cand.name.startswith(texture):
+                return cand
+    return None
 
 
 def _load_numeric_array(x: Any, key: str) -> Optional[np.ndarray]:
@@ -182,9 +358,16 @@ def preprocess(cfg: PreCfg) -> int:
     ensure_dir(cfg.out_path.parent)
     ensure_dir(cfg.debug_dir)
 
-    df_raw = _read_raw_table(cfg.raw_path)
-    if "texture_id" not in df_raw.columns or "image_path" not in df_raw.columns:
-        raise ValueError("Raw table must contain at least 'texture_id' and 'image_path' columns")
+    # Decide input mode (HAVdb scan vs. table)
+    rows: List[Dict[str, Any]] = []
+    uv_fallbacks = 0
+    total_windows = 0
+    h5_list = _scan_havdb_h5(cfg.raw_path) if cfg.raw_path.is_dir() else []
+    using_havdb = len(h5_list) > 0
+    if not using_havdb:
+        df_raw = _read_raw_table(cfg.raw_path)
+        if "texture_id" not in df_raw.columns or "image_path" not in df_raw.columns:
+            raise ValueError("Raw table must contain at least 'texture_id' and 'image_path' columns")
 
     # Stats accumulators
     patch_sum = 0.0
@@ -202,11 +385,116 @@ def preprocess(cfg: PreCfg) -> int:
     hop_v = int(max(1, round(win_v * cfg.hop_ratio)))
     sos = _butter_bandpass_sos(cfg.band_vib[0], cfg.band_vib[1], fs_v)
 
-    rows: List[Dict[str, Any]] = []
-    uv_fallbacks = 0
-    total_windows = 0
-
-    for ridx, row in df_raw.iterrows():
+    if using_havdb:
+        # Image roots to search
+        candidate_img_roots = [cfg.raw_path / "img", cfg.raw_path.parent / "img", cfg.raw_path]
+        common_sr = max(fs_v, fs_a)
+        for rec in h5_list:
+            user = rec["user"]; tex_id = rec["texture"]; trial = rec["trial"]
+            h5_path = rec["h5_path"]
+            # base path containing user folders
+            local_root = h5_path.parents[2] if len(h5_path.parents) >= 2 else cfg.raw_path
+            try:
+                data, _ = hav_load_data(str(local_root), user, tex_id, trial, sampling_rate=common_sr)
+            except Exception as ex:
+                warnings.warn(f"HAVdb load failed for {h5_path}: {ex}")
+                continue
+            common_time, position, speed, direction, vibration, audio, force, torque = data
+            vib_ch = vibration[:, 0].astype(np.float32)
+            aud_ch = audio[:, 0].astype(np.float32) if isinstance(audio, np.ndarray) and audio.size else None
+            # resample to target rates
+            vib_rs = resample_poly(vib_ch, fs_v, common_sr) if common_sr != fs_v else vib_ch
+            if aud_ch is not None:
+                aud_rs = resample_poly(aud_ch, fs_a, common_sr) if common_sr != fs_a else aud_ch
+            else:
+                aud_rs = None
+            # vib preprocessing
+            vib_rs = vib_rs - float(np.mean(vib_rs))
+            try:
+                vib_rs = sosfiltfilt(sos, vib_rs).astype(np.float32)
+            except Exception:
+                pass
+            # states
+            sp = speed.squeeze().astype(np.float32)
+            if sp.ndim > 1:
+                sp = sp[:, 0]
+            sp_rs = resample_poly(sp, fs_v, common_sr) if common_sr != fs_v else sp
+            if isinstance(force, np.ndarray) and force.ndim == 2 and force.shape[1] >= 3:
+                fo_mag = np.linalg.norm(force[:, :3], axis=1).astype(np.float32)
+            else:
+                fo_mag = np.asarray(force).squeeze().astype(np.float32)
+            fo_rs = resample_poly(fo_mag, fs_v, common_sr) if common_sr != fs_v else fo_mag
+            # select texture image
+            img_path = None
+            for base in candidate_img_roots:
+                img_path = _choose_texture_image(base, tex_id)
+                if img_path is not None:
+                    break
+            if img_path is None:
+                warnings.warn(f"No texture image found for {tex_id} near {cfg.raw_path}")
+                continue
+            # windows over vib
+            win_idx = _window_indices(len(vib_rs), win_v, hop_v)
+            for wj, (s, e) in enumerate(win_idx):
+                total_windows += 1
+                sp_m = float(np.mean(sp_rs[s:e])) if e <= len(sp_rs) else 0.0
+                fo_m = float(np.mean(fo_rs[s:e])) if e <= len(fo_rs) else 0.0
+                if sp_m <= float(cfg.speed_thresh):
+                    continue
+                v_win = vib_rs[s:e].astype(np.float32)
+                if len(v_win) != win_v:
+                    continue
+                v_win = (v_win - float(np.mean(v_win))).astype(np.float32)
+                vib_sq_acc += float(np.sum(np.square(v_win)))
+                vib_count += len(v_win)
+                # previous
+                pv_win = None
+                ps, pe = s - win_v, s
+                if ps >= 0:
+                    pv_win = vib_rs[ps:pe].astype(np.float32)
+                    pv_win = (pv_win - float(np.mean(pv_win))).astype(np.float32)
+                # audio align
+                a_win = None
+                if aud_rs is not None:
+                    s_a = int(round(s * (fs_a / fs_v)))
+                    e_a = s_a + win_a
+                    if e_a <= len(aud_rs):
+                        a_win = aud_rs[s_a:e_a].astype(np.float32)
+                        # target RMS -12 dBFS
+                        target_rms = 10 ** (-12 / 20)
+                        cur = _rms(a_win)
+                        if cur > 1e-9:
+                            a_win = (a_win * (target_rms / cur)).astype(np.float32)
+                        a_win = np.clip(a_win, -1.0, 1.0)
+                # pseudo UV
+                u_c, v_c = _pseudo_uv(tex_id, wj)
+                uv_fallbacks += 1
+                # patch stats
+                try:
+                    patch_arr = _crop_wrap_gray(img_path, u_c, v_c, cfg.patch)
+                    patch_sum += float(np.sum(patch_arr))
+                    patch_sq_sum += float(np.sum(patch_arr ** 2))
+                    patch_count += patch_arr.size
+                except Exception:
+                    pass
+                speeds_all.append(sp_m)
+                forces_all.append(fo_m)
+                rows.append({
+                    "texture_id": tex_id,
+                    "image_path": str(img_path),
+                    "window_index": int(wj),
+                    "u": u_c,
+                    "v": v_c,
+                    "speed_mean": sp_m,
+                    "force_mean": fo_m,
+                    "vib": v_win.tolist(),
+                    "prev_vib": pv_win.tolist() if pv_win is not None else None,
+                    "audio": a_win.tolist() if a_win is not None else None,
+                    "fs_vib": fs_v,
+                    "fs_aud": fs_a,
+                })
+    else:
+        for ridx, row in df_raw.iterrows():
         tex_id = row.get("texture_id")
         img_path = Path(str(row.get("image_path")))
         if not img_path.exists():
