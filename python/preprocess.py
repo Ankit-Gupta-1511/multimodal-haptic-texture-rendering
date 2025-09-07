@@ -21,6 +21,7 @@ import json
 import warnings
 from dataclasses import dataclass
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -270,6 +271,160 @@ def _pseudo_uv(texture_id: Any, window_index: int) -> Tuple[float, float]:
     return float(rng.uniform(0.2, 0.8)), float(rng.uniform(0.2, 0.8))
 
 
+def _load_image_gray_arr(img_path: Path) -> Optional[np.ndarray]:
+    try:
+        with Image.open(img_path) as im:
+            im = im.convert("L")
+            return (np.asarray(im, dtype=np.float32) / 255.0)
+    except Exception:
+        return None
+
+
+def _crop_from_arr_wrap(arr: np.ndarray, u: float, v: float, patch: int) -> np.ndarray:
+    H, W = arr.shape
+    cx = int(round(u * (W - 1)))
+    cy = int(round(v * (H - 1)))
+    half = patch // 2
+    xs = np.arange(cx - half, cx - half + patch)
+    ys = np.arange(cy - half, cy - half + patch)
+    xs = np.mod(xs, W)
+    ys = np.mod(ys, H)
+    return arr[np.ix_(ys, xs)].astype(np.float32)
+
+
+def _process_record_worker(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Worker-safe per-file processing for parallel mode."""
+    try:
+        user = args["user"]; tex_id = args["texture"]; trial = args["trial"]
+        h5_path = Path(args["h5_path"])  # not used directly; local_root holds base
+        local_root = Path(args["local_root"])  # root containing user folders
+        fs_v = int(args["fs_v"]); fs_a = int(args["fs_a"]) 
+        win_v = int(args["win_v"]); win_a = int(args["win_a"]); hop_v = int(args["hop_v"]) 
+        lo, hi = float(args["band_lo"]), float(args["band_hi"]) 
+        speed_thresh = float(args["speed_thresh"]) 
+        patch = int(args["patch"]) 
+        hop_prune = max(1, int(args.get("hop_prune", 1)))
+        img_roots = [Path(p) for p in args["img_roots"]]
+
+        data, _ = hav_load_data(str(local_root), user, tex_id, trial, sampling_rate=max(fs_v, fs_a))
+        _, position, speed, direction, vibration, audio, force, torque = data
+        vib_ch = vibration[:, 0].astype(np.float32)
+        aud_ch = audio[:, 0].astype(np.float32) if isinstance(audio, np.ndarray) and audio.size else None
+        vib_rs = resample_poly(vib_ch, fs_v, max(fs_v, fs_a)) if max(fs_v, fs_a) != fs_v else vib_ch
+        if aud_ch is not None:
+            aud_rs = resample_poly(aud_ch, fs_a, max(fs_v, fs_a)) if max(fs_v, fs_a) != fs_a else aud_ch
+        else:
+            aud_rs = None
+        vib_rs = vib_rs - float(np.mean(vib_rs))
+        try:
+            sos = _butter_bandpass_sos(lo, hi, fs_v)
+            vib_rs = sosfiltfilt(sos, vib_rs).astype(np.float32)
+        except Exception:
+            pass
+
+        sp = speed.squeeze().astype(np.float32)
+        if sp.ndim > 1:
+            sp = sp[:, 0]
+        sp_rs = resample_poly(sp, fs_v, max(fs_v, fs_a)) if max(fs_v, fs_a) != fs_v else sp
+        if isinstance(force, np.ndarray) and force.ndim == 2 and force.shape[1] >= 3:
+            fo_mag = np.linalg.norm(force[:, :3], axis=1).astype(np.float32)
+        else:
+            fo_mag = np.asarray(force).squeeze().astype(np.float32)
+        fo_rs = resample_poly(fo_mag, fs_v, max(fs_v, fs_a)) if max(fs_v, fs_a) != fs_v else fo_mag
+
+        # choose image
+        img_path = None
+        for base in img_roots:
+            cand = _choose_texture_image(base, tex_id)
+            if cand is not None:
+                img_path = cand
+                break
+        if img_path is None:
+            return {"failed": False, "rows": [], "images_missing": 1, "uv_fallbacks": 0, "total_windows": 0,
+                    "patch_sum": 0.0, "patch_sq_sum": 0.0, "patch_count": 0, "speeds": [], "forces": [], "vib_sq_acc": 0.0, "vib_count": 0}
+        img_arr = _load_image_gray_arr(img_path)
+        if img_arr is None:
+            return {"failed": False, "rows": [], "images_missing": 1, "uv_fallbacks": 0, "total_windows": 0,
+                    "patch_sum": 0.0, "patch_sq_sum": 0.0, "patch_count": 0, "speeds": [], "forces": [], "vib_sq_acc": 0.0, "vib_count": 0}
+
+        rows: List[Dict[str, Any]] = []
+        patch_sum = 0.0; patch_sq_sum = 0.0; patch_count = 0
+        speeds_all: List[float] = []; forces_all: List[float] = []
+        vib_sq_acc = 0.0; vib_count = 0
+        uv_fallbacks = 0; total_windows = 0
+        kept = 0
+        for wj, (s, e) in enumerate(_window_indices(len(vib_rs), win_v, hop_v)):
+            total_windows += 1
+            sp_m = float(np.mean(sp_rs[s:e])) if e <= len(sp_rs) else 0.0
+            fo_m = float(np.mean(fo_rs[s:e])) if e <= len(fo_rs) else 0.0
+            if sp_m <= speed_thresh:
+                continue
+            if hop_prune > 1:
+                if (kept % hop_prune) != 0:
+                    kept += 1
+                    continue
+                kept += 1
+            v_win = vib_rs[s:e].astype(np.float32)
+            if len(v_win) != win_v:
+                continue
+            v_win = (v_win - float(np.mean(v_win))).astype(np.float32)
+            vib_sq_acc += float(np.sum(np.square(v_win)))
+            vib_count += len(v_win)
+            pv_win = None
+            ps, pe = s - win_v, s
+            if ps >= 0:
+                pv_win = vib_rs[ps:pe].astype(np.float32)
+                pv_win = (pv_win - float(np.mean(pv_win))).astype(np.float32)
+            a_win = None
+            if aud_rs is not None:
+                s_a = int(round(s * (fs_a / fs_v)))
+                e_a = s_a + win_a
+                if e_a <= len(aud_rs):
+                    a_win = aud_rs[s_a:e_a].astype(np.float32)
+                    target_rms = 10 ** (-12 / 20)
+                    cur = float(np.sqrt(np.mean(np.square(a_win))) + 1e-12)
+                    if cur > 1e-9:
+                        a_win = (a_win * (target_rms / cur)).astype(np.float32)
+                    a_win = np.clip(a_win, -1.0, 1.0)
+            u_c, v_c = _pseudo_uv(tex_id, wj); uv_fallbacks += 1
+            try:
+                p_arr = _crop_from_arr_wrap(img_arr, u_c, v_c, patch)
+                patch_sum += float(np.sum(p_arr)); patch_sq_sum += float(np.sum(np.square(p_arr))); patch_count += p_arr.size
+            except Exception:
+                pass
+            speeds_all.append(sp_m); forces_all.append(fo_m)
+            rows.append({
+                "texture_id": tex_id,
+                "image_path": str(img_path),
+                "window_index": int(wj),
+                "u": u_c,
+                "v": v_c,
+                "speed_mean": sp_m,
+                "force_mean": fo_m,
+                "vib": v_win.tolist(),
+                "prev_vib": pv_win.tolist() if pv_win is not None else None,
+                "audio": a_win.tolist() if a_win is not None else None,
+                "fs_vib": fs_v,
+                "fs_aud": fs_a,
+            })
+        return {
+            "failed": False,
+            "rows": rows,
+            "patch_sum": patch_sum,
+            "patch_sq_sum": patch_sq_sum,
+            "patch_count": patch_count,
+            "speeds": speeds_all,
+            "forces": forces_all,
+            "vib_sq_acc": vib_sq_acc,
+            "vib_count": vib_count,
+            "uv_fallbacks": uv_fallbacks,
+            "total_windows": total_windows,
+            "images_missing": 0,
+        }
+    except Exception:
+        return {"failed": True}
+
+
 # ---------------------------- Core pipeline ----------------------------
 
 @dataclass
@@ -291,6 +446,8 @@ class PreCfg:
     max_windows: int = 0
     verbose: int = 1
     progress: int = 1
+    workers: int = 0
+    hop_prune: int = 1
 
 
 def _split_by_texture(textures: List[Any], val_n: int, test_n: int, seed: int = 1337) -> Dict[Any, str]:
@@ -357,125 +514,191 @@ def preprocess(cfg: PreCfg) -> int:
     files_processed = 0
     files_failed = 0
     images_missing = 0
-    iterator = tqdm(h5_list, total=len(h5_list), desc="[preprocess] files", disable=not bool(cfg.progress))
-    for rec in iterator:
-        file_t0 = time.time()
-        user = rec["user"]; tex_id = rec["texture"]; trial = rec["trial"]
-        h5_path = rec["h5_path"]
-        # base path containing user folders
-        local_root = h5_path.parents[2] if len(h5_path.parents) >= 2 else raw
-        try:
-            data, _ = hav_load_data(str(local_root), user, tex_id, trial, sampling_rate=common_sr)
-        except Exception as ex:
-            warnings.warn(f"HAVdb load failed for {h5_path}: {ex}")
-            files_failed += 1
-            continue
-        common_time, position, speed, direction, vibration, audio, force, torque = data
-        vib_ch = vibration[:, 0].astype(np.float32)
-        aud_ch = audio[:, 0].astype(np.float32) if isinstance(audio, np.ndarray) and audio.size else None
-        # resample to target rates
-        vib_rs = resample_poly(vib_ch, fs_v, common_sr) if common_sr != fs_v else vib_ch
-        if aud_ch is not None:
-            aud_rs = resample_poly(aud_ch, fs_a, common_sr) if common_sr != fs_a else aud_ch
-        else:
-            aud_rs = None
-        # vib preprocessing
-        vib_rs = vib_rs - float(np.mean(vib_rs))
-        try:
-            vib_rs = sosfiltfilt(sos, vib_rs).astype(np.float32)
-        except Exception:
-            pass
-        # states
-        sp = speed.squeeze().astype(np.float32)
-        if sp.ndim > 1:
-            sp = sp[:, 0]
-        sp_rs = resample_poly(sp, fs_v, common_sr) if common_sr != fs_v else sp
-        if isinstance(force, np.ndarray) and force.ndim == 2 and force.shape[1] >= 3:
-            fo_mag = np.linalg.norm(force[:, :3], axis=1).astype(np.float32)
-        else:
-            fo_mag = np.asarray(force).squeeze().astype(np.float32)
-        fo_rs = resample_poly(fo_mag, fs_v, common_sr) if common_sr != fs_v else fo_mag
-        # select texture image
-        img_path = None
-        for base in candidate_img_roots:
-            img_path = _choose_texture_image(base, tex_id)
-            if img_path is not None:
-                break
-        if img_path is None:
-            warnings.warn(f"No texture image found for {tex_id} near {raw}")
-            images_missing += 1
-            continue
-        # windows over vib
-        win_idx = _window_indices(len(vib_rs), win_v, hop_v)
-        kept_in_file = 0
-        for wj, (s, e) in enumerate(win_idx):
-            total_windows += 1
-            sp_m = float(np.mean(sp_rs[s:e])) if e <= len(sp_rs) else 0.0
-            fo_m = float(np.mean(fo_rs[s:e])) if e <= len(fo_rs) else 0.0
-            if sp_m <= float(cfg.speed_thresh):
-                continue
-            v_win = vib_rs[s:e].astype(np.float32)
-            if len(v_win) != win_v:
-                continue
-            v_win = (v_win - float(np.mean(v_win))).astype(np.float32)
-            vib_sq_acc += float(np.sum(np.square(v_win)))
-            vib_count += len(v_win)
-            # previous
-            pv_win = None
-            ps, pe = s - win_v, s
-            if ps >= 0:
-                pv_win = vib_rs[ps:pe].astype(np.float32)
-                pv_win = (pv_win - float(np.mean(pv_win))).astype(np.float32)
-            # audio align
-            a_win = None
-            if aud_rs is not None:
-                s_a = int(round(s * (fs_a / fs_v)))
-                e_a = s_a + win_a
-                if e_a <= len(aud_rs):
-                    a_win = aud_rs[s_a:e_a].astype(np.float32)
-                    # target RMS -12 dBFS
-                    target_rms = 10 ** (-12 / 20)
-                    cur = _rms(a_win)
-                    if cur > 1e-9:
-                        a_win = (a_win * (target_rms / cur)).astype(np.float32)
-                    a_win = np.clip(a_win, -1.0, 1.0)
-            # pseudo UV
-            u_c, v_c = _pseudo_uv(tex_id, wj)
-            uv_fallbacks += 1
-            # patch stats
+    if int(cfg.workers) > 0:
+        # Parallel path
+        futures = []
+        with ProcessPoolExecutor(max_workers=int(cfg.workers)) as pool:
+            for rec in h5_list:
+                h5_path = rec["h5_path"]
+                local_root = h5_path.parents[2] if len(h5_path.parents) >= 2 else raw
+                args_map = {
+                    "user": rec["user"],
+                    "texture": rec["texture"],
+                    "trial": rec["trial"],
+                    "h5_path": str(rec["h5_path"]),
+                    "local_root": str(local_root),
+                    "fs_v": fs_v,
+                    "fs_a": fs_a,
+                    "win_v": win_v,
+                    "win_a": win_a,
+                    "hop_v": hop_v,
+                    "band_lo": float(cfg.band_vib[0]),
+                    "band_hi": float(cfg.band_vib[1]),
+                    "speed_thresh": float(cfg.speed_thresh),
+                    "patch": int(cfg.patch),
+                    "hop_prune": int(cfg.hop_prune),
+                    "img_roots": [str(p) for p in candidate_img_roots],
+                }
+                futures.append(pool.submit(_process_record_worker, args_map))
+            prog = tqdm(total=len(futures), desc="[preprocess] files", disable=not bool(cfg.progress))
+            for fut in as_completed(futures):
+                prog.update(1)
+                res = fut.result()
+                if res.get("failed"):
+                    files_failed += 1
+                    continue
+                files_processed += 1
+                images_missing += int(res.get("images_missing", 0))
+                uv_fallbacks += int(res.get("uv_fallbacks", 0))
+                total_windows += int(res.get("total_windows", 0))
+                patch_sum += float(res.get("patch_sum", 0.0))
+                patch_sq_sum += float(res.get("patch_sq_sum", 0.0))
+                patch_count += int(res.get("patch_count", 0))
+                speeds_all.extend(res.get("speeds", []))
+                forces_all.extend(res.get("forces", []))
+                rws = res.get("rows", [])
+                if cfg.max_windows and cfg.max_windows > 0:
+                    remaining = cfg.max_windows - len(rows)
+                    if remaining > 0:
+                        rows.extend(rws[:remaining])
+                else:
+                    rows.extend(rws)
+                if cfg.max_windows and len(rows) >= cfg.max_windows:
+                    break
+            prog.close()
+        # fall-through to writing
+    else:
+        iterator = tqdm(h5_list, total=len(h5_list), desc="[preprocess] files", disable=not bool(cfg.progress))
+        for rec in iterator:
+            file_t0 = time.time()
+            user = rec["user"]; tex_id = rec["texture"]; trial = rec["trial"]
+            h5_path = rec["h5_path"]
+            # base path containing user folders
+            local_root = h5_path.parents[2] if len(h5_path.parents) >= 2 else raw
             try:
-                patch_arr = _crop_wrap_gray(img_path, u_c, v_c, cfg.patch)
-                patch_sum += float(np.sum(patch_arr))
-                patch_sq_sum += float(np.sum(patch_arr ** 2))
-                patch_count += patch_arr.size
+                data, _ = hav_load_data(str(local_root), user, tex_id, trial, sampling_rate=common_sr)
+            except Exception as ex:
+                warnings.warn(f"HAVdb load failed for {h5_path}: {ex}")
+                files_failed += 1
+                continue
+            common_time, position, speed, direction, vibration, audio, force, torque = data
+            vib_ch = vibration[:, 0].astype(np.float32)
+            aud_ch = audio[:, 0].astype(np.float32) if isinstance(audio, np.ndarray) and audio.size else None
+            # resample to target rates
+            vib_rs = resample_poly(vib_ch, fs_v, common_sr) if common_sr != fs_v else vib_ch
+            if aud_ch is not None:
+                aud_rs = resample_poly(aud_ch, fs_a, common_sr) if common_sr != fs_a else aud_ch
+            else:
+                aud_rs = None
+            # vib preprocessing
+            vib_rs = vib_rs - float(np.mean(vib_rs))
+            try:
+                vib_rs = sosfiltfilt(sos, vib_rs).astype(np.float32)
             except Exception:
                 pass
-            speeds_all.append(sp_m)
-            forces_all.append(fo_m)
-            rows.append({
-                "texture_id": tex_id,
-                "image_path": str(img_path),
-                "window_index": int(wj),
-                "u": u_c,
-                "v": v_c,
-                "speed_mean": sp_m,
-                "force_mean": fo_m,
-                "vib": v_win.tolist(),
-                "prev_vib": pv_win.tolist() if pv_win is not None else None,
-                "audio": a_win.tolist() if a_win is not None else None,
-                "fs_vib": fs_v,
-                "fs_aud": fs_a,
-            })
-            kept_in_file += 1
+            # states
+            sp = speed.squeeze().astype(np.float32)
+            if sp.ndim > 1:
+                sp = sp[:, 0]
+            sp_rs = resample_poly(sp, fs_v, common_sr) if common_sr != fs_v else sp
+            if isinstance(force, np.ndarray) and force.ndim == 2 and force.shape[1] >= 3:
+                fo_mag = np.linalg.norm(force[:, :3], axis=1).astype(np.float32)
+            else:
+                fo_mag = np.asarray(force).squeeze().astype(np.float32)
+            fo_rs = resample_poly(fo_mag, fs_v, common_sr) if common_sr != fs_v else fo_mag
+            # select texture image
+            img_path = None
+            for base in candidate_img_roots:
+                img_path = _choose_texture_image(base, tex_id)
+                if img_path is not None:
+                    break
+            if img_path is None:
+                warnings.warn(f"No texture image found for {tex_id} near {raw}")
+                images_missing += 1
+                continue
+            # cache image array once per file
+            img_arr = _load_image_gray_arr(img_path)
+            if img_arr is None:
+                warnings.warn(f"Failed to load image {img_path} for texture {tex_id}")
+                images_missing += 1
+                continue
+            # windows over vib
+            win_idx = _window_indices(len(vib_rs), win_v, hop_v)
+            kept_in_file = 0
+            for wj, (s, e) in enumerate(win_idx):
+                total_windows += 1
+                sp_m = float(np.mean(sp_rs[s:e])) if e <= len(sp_rs) else 0.0
+                fo_m = float(np.mean(fo_rs[s:e])) if e <= len(fo_rs) else 0.0
+                if sp_m <= float(cfg.speed_thresh):
+                    continue
+                # optional density pruning: keep every k-th kept window
+                if int(cfg.hop_prune) > 1:
+                    if (kept_in_file % int(cfg.hop_prune)) != 0:
+                        kept_in_file += 1
+                        continue
+                    kept_in_file += 1
+                v_win = vib_rs[s:e].astype(np.float32)
+                if len(v_win) != win_v:
+                    continue
+                v_win = (v_win - float(np.mean(v_win))).astype(np.float32)
+                vib_sq_acc += float(np.sum(np.square(v_win)))
+                vib_count += len(v_win)
+                # previous
+                pv_win = None
+                ps, pe = s - win_v, s
+                if ps >= 0:
+                    pv_win = vib_rs[ps:pe].astype(np.float32)
+                    pv_win = (pv_win - float(np.mean(pv_win))).astype(np.float32)
+                # audio align
+                a_win = None
+                if aud_rs is not None:
+                    s_a = int(round(s * (fs_a / fs_v)))
+                    e_a = s_a + win_a
+                    if e_a <= len(aud_rs):
+                        a_win = aud_rs[s_a:e_a].astype(np.float32)
+                        # target RMS -12 dBFS
+                        target_rms = 10 ** (-12 / 20)
+                        cur = _rms(a_win)
+                        if cur > 1e-9:
+                            a_win = (a_win * (target_rms / cur)).astype(np.float32)
+                        a_win = np.clip(a_win, -1.0, 1.0)
+                # pseudo UV
+                u_c, v_c = _pseudo_uv(tex_id, wj)
+                uv_fallbacks += 1
+                # patch stats using cached image array
+                try:
+                    patch_arr = _crop_from_arr_wrap(img_arr, u_c, v_c, cfg.patch)
+                    patch_sum += float(np.sum(patch_arr))
+                    patch_sq_sum += float(np.sum(np.square(patch_arr)))
+                    patch_count += patch_arr.size
+                except Exception:
+                    pass
+                speeds_all.append(sp_m)
+                forces_all.append(fo_m)
+                rows.append({
+                    "texture_id": tex_id,
+                    "image_path": str(img_path),
+                    "window_index": int(wj),
+                    "u": u_c,
+                    "v": v_c,
+                    "speed_mean": sp_m,
+                    "force_mean": fo_m,
+                    "vib": v_win.tolist(),
+                    "prev_vib": pv_win.tolist() if pv_win is not None else None,
+                    "audio": a_win.tolist() if a_win is not None else None,
+                    "fs_vib": fs_v,
+                    "fs_aud": fs_a,
+                })
+                kept_in_file += 1
+                if cfg.max_windows and len(rows) >= cfg.max_windows:
+                    print(f"[preprocess] Reached max_windows={cfg.max_windows}; early stopping.", flush=True)
+                    break
+            files_processed += 1
+            if cfg.verbose:
+                dt = time.time() - file_t0
+                print(f"[preprocess] done user={user} texture={tex_id} trial={trial} kept={kept_in_file} dt={dt:.2f}s", flush=True)
             if cfg.max_windows and len(rows) >= cfg.max_windows:
-                print(f"[preprocess] Reached max_windows={cfg.max_windows}; early stopping.", flush=True)
                 break
-        files_processed += 1
-        if cfg.verbose:
-            dt = time.time() - file_t0
-            print(f"[preprocess] done user={user} texture={tex_id} trial={trial} kept={kept_in_file} dt={dt:.2f}s", flush=True)
-        if cfg.max_windows and len(rows) >= cfg.max_windows:
-            break
 
     if not rows:
         raise RuntimeError("No windows produced. Check speed threshold, raw signals, and timing alignment.")
@@ -604,6 +827,8 @@ def main():
     p.add_argument("--max_windows", type=int, default=0, help="Limit number of windows for debugging")
     p.add_argument("--verbose", type=int, default=1, help="Verbosity level (0=silent,1=info)")
     p.add_argument("--progress", type=int, default=1, help="Show progress bar (1=yes,0=no)")
+    p.add_argument("--workers", type=int, default=0, help="[experimental] parallelize per-file (0=off)")
+    p.add_argument("--hop_prune", type=int, default=1, help="Keep every k-th kept window to cap density")
     args = p.parse_args()
 
     cfg = PreCfg(
@@ -624,6 +849,8 @@ def main():
         max_windows=int(args.max_windows),
         verbose=int(args.verbose),
         progress=int(args.progress),
+        workers=int(args.workers),
+        hop_prune=int(args.hop_prune),
     )
     sys.exit(preprocess(cfg))
 
