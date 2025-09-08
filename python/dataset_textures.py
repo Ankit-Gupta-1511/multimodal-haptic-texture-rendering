@@ -217,9 +217,32 @@ class VisuoTactileDataset(Dataset):
             if len(df_split) == 0:
                 raise RuntimeError(
                     f"No rows for split={self.split} even after fallback split. Re-run preprocessing with fewer val/test textures or lower speed_thresh.")
+        # Optional modality requirements: filter rows missing audio/prev_vib
+        def _has_val(x) -> bool:
+            if x is None:
+                return False
+            if isinstance(x, float) and np.isnan(x):
+                return False
+            return True
+        before = len(df_split)
+        if self.cfg.use_audio:
+            if "audio" in df_split.columns:
+                df_split = df_split[df_split["audio"].apply(_has_val)].reset_index(drop=True)
+            if len(df_split) == 0:
+                raise RuntimeError("Requested use_audio=True but no rows contain audio. Re-run preprocessing with audio available or disable use_audio/mode.")
+        if self.cfg.use_prev:
+            if "prev_vib" in df_split.columns:
+                df_split = df_split[df_split["prev_vib"].apply(_has_val)].reset_index(drop=True)
+            if len(df_split) == 0:
+                raise RuntimeError("Requested use_prev=True but no rows contain prev_vib segments. Consider disabling use_prev or adjust windowing.")
+        dropped = before - len(df_split)
+        if dropped > 0:
+            warnings.warn(f"Filtered out {dropped} rows missing required modalities (audio/prev_vib). Remaining: {len(df_split)}")
         self.df = df_split
         self._fallback_uv_count = 0
         self._total_uv = len(df)
+        # Simple in-memory image cache to speed up patch cropping across epochs
+        self._img_cache: Dict[str, np.ndarray] = {}
 
     def __len__(self) -> int:
         return len(self.df)
@@ -242,7 +265,13 @@ class VisuoTactileDataset(Dataset):
         if (u is None or v is None or not (0.0 <= float(u) <= 1.0 and 0.0 <= float(v) <= 1.0)) and self.cfg.deterministic_patches:
             self._fallback_uv_count += 1
         try:
-            patch_arr = _crop_wrap_gray(img_path, uu, vv, self.cfg.patch)
+            # cache image array and crop from it to avoid repeated disk I/O
+            key = str(img_path)
+            arr = self._img_cache.get(key)
+            if arr is None:
+                arr = _load_image_gray_arr(img_path)
+                self._img_cache[key] = arr
+            patch_arr = _crop_from_arr_wrap(arr, uu, vv, self.cfg.patch)
         except Exception as ex:
             raise RuntimeError(f"Patch crop failed texture_id={tex_id} image={img_path} (u={uu:.3f},v={vv:.3f}): {ex}")
         patch_arr = (patch_arr - self.patch_mean) / (self.patch_std + 1e-6)
@@ -350,6 +379,22 @@ def main():
     p = argparse.ArgumentParser(description="VisuoTactileDataset sanity inspection")
     p.add_argument("--data", type=str, required=True, help="Path to parquet/h5 table")
     p.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
+def _load_image_gray_arr(img_path: Path) -> np.ndarray:
+    with Image.open(img_path) as im:
+        im = im.convert("L")
+        return np.asarray(im, dtype=np.float32) / 255.0
+
+
+def _crop_from_arr_wrap(arr: np.ndarray, u: float, v: float, patch: int) -> np.ndarray:
+    H, W = arr.shape
+    cx = int(round(u * (W - 1)))
+    cy = int(round(v * (H - 1)))
+    half = patch // 2
+    xs = np.arange(cx - half, cx - half + patch)
+    ys = np.arange(cy - half, cy - half + patch)
+    xs = np.mod(xs, W)
+    ys = np.mod(ys, H)
+    return arr[np.ix_(ys, xs)].astype(np.float32)
     p.add_argument("--inspect", type=int, default=64)
     p.add_argument("--out", type=str, default="assets/debug_samples")
     args = p.parse_args()
