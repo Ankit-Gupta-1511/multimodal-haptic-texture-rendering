@@ -11,13 +11,17 @@ model:
   use_prev: false
 train:
   epochs: 100
-  batch: 8
+  batch: 16
   lr: 1e-3
   weight_decay: 0.01
   amp: true
   grad_clip: 5.0
   early_stop_patience: 12
-  workers: 0
+  workers: 4
+  prefetch_factor: 4
+  deterministic: false
+  benchmark: true
+  channels_last: false
   overfit_batches: 0
 loss:
   w_stft_vib: 0.5
@@ -27,4 +31,3 @@ loss:
 logs:
   tb_dir: runs
   debug_dir: assets/debug
-

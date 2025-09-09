@@ -64,8 +64,18 @@ def build_loaders(data_path: str, mode: str, params: Dict[str, Any], workers: in
     )
     ds_train = VisuoTactileDataset(split="train", **common)
     ds_val = VisuoTactileDataset(split="val", **common)
-    dl_train = DataLoader(ds_train, batch_size=int(params["train"]["batch"]), shuffle=True, num_workers=workers, pin_memory=True, drop_last=True)
-    dl_val = DataLoader(ds_val, batch_size=int(params["train"]["batch"]), shuffle=False, num_workers=workers, pin_memory=True)
+
+    pin_mem = torch.cuda.is_available()
+    pf = int(params["train"].get("prefetch_factor", 2))
+
+    dl_train_kwargs = dict(batch_size=int(params["train"]["batch"]), shuffle=True, num_workers=workers, pin_memory=pin_mem, drop_last=True)
+    dl_val_kwargs = dict(batch_size=int(params["train"]["batch"]), shuffle=False, num_workers=workers, pin_memory=pin_mem)
+    if workers and workers > 0:
+        dl_train_kwargs.update(persistent_workers=True, prefetch_factor=pf)
+        dl_val_kwargs.update(persistent_workers=True, prefetch_factor=pf)
+
+    dl_train = DataLoader(ds_train, **dl_train_kwargs)
+    dl_val = DataLoader(ds_val, **dl_val_kwargs)
     return ds_train, ds_val, dl_train, dl_val
 
 
@@ -147,7 +157,11 @@ def train_loop(args) -> int:
     params = load_params(Path(args.params))
     mode = args.mode or params.get("mode", "baseline_vibro")
     seed_all(42)
-    torch.backends.cudnn.deterministic = True
+    # cuDNN performance knobs
+    cudnn_det = bool(params["train"].get("deterministic", False))
+    cudnn_bench = bool(params["train"].get("benchmark", True))
+    torch.backends.cudnn.deterministic = cudnn_det
+    torch.backends.cudnn.benchmark = cudnn_bench
 
     # data
     ds_train, ds_val, dl_train, dl_val = build_loaders(args.data, mode, params, workers=int(params["train"]["workers"]))
@@ -155,6 +169,9 @@ def train_loop(args) -> int:
     # model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = build_model(mode, params).to(device)
+    use_channels_last = bool(params["train"].get("channels_last", False)) and device.type == "cuda"
+    if use_channels_last:
+        net = net.to(memory_format=torch.channels_last)
     opt = torch.optim.AdamW(net.parameters(), lr=float(params["train"]["lr"]), weight_decay=float(params["train"]["weight_decay"]))
     for g in opt.param_groups:
         g.setdefault("initial_lr", g["lr"])  # scheduler support
@@ -198,6 +215,8 @@ def train_loop(args) -> int:
                 if overfit_batches and i >= overfit_batches:
                     break
                 batch = to_device(batch, device)
+                if use_channels_last and isinstance(batch.get("patch"), torch.Tensor):
+                    batch["patch"] = batch["patch"].contiguous(memory_format=torch.channels_last)
                 opt.zero_grad(set_to_none=True)
                 with amp_autocast(bool(params["train"]["amp"])):
                     if mode == "low_delay_vibro":
@@ -234,6 +253,8 @@ def train_loop(args) -> int:
             with torch.no_grad():
                 for j, vb in enumerate(dl_val):
                     vb = to_device(vb, device)
+                    if use_channels_last and isinstance(vb.get("patch"), torch.Tensor):
+                        vb["patch"] = vb["patch"].contiguous(memory_format=torch.channels_last)
                     if mode == "low_delay_vibro":
                         vout = net(vb["patch"], vb["state"], vb.get("prev_vib"))
                     else:
@@ -313,30 +334,53 @@ def test_once(data_path: str, mode: str, ckpt_path: Path, params: Dict[str, Any]
         use_audio=use_audio,
         use_prev=use_prev,
     )
-    dl_test = DataLoader(ds_test, batch_size=int(params["train"]["batch"]), shuffle=False, num_workers=int(params["train"]["workers"]), pin_memory=True)
+    workers = int(params["train"]["workers"])
+    pin_mem = torch.cuda.is_available()
+    pf = int(params["train"].get("prefetch_factor", 2))
+    dl_test_kwargs = dict(batch_size=int(params["train"]["batch"]), shuffle=False, num_workers=workers, pin_memory=pin_mem)
+    if workers and workers > 0:
+        dl_test_kwargs.update(persistent_workers=True, prefetch_factor=pf)
+    dl_test = DataLoader(ds_test, **dl_test_kwargs)
     # model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = build_model(mode, params).to(device).eval()
-    # Safer load: prefer weights_only=True when available; fallback otherwise
+    use_channels_last = bool(params["train"].get("channels_last", False)) and device.type == "cuda"
+    if use_channels_last:
+        net = net.to(memory_format=torch.channels_last)
+    # Robust load: accept extra heads (e.g., audio) and shape mismatches by filtering
     try:
-        state = torch.load(ckpt_path, map_location=device, weights_only=True)  # PyTorch >=2.1
-        if isinstance(state, dict) and any(k.startswith("enc_img") or k.startswith("fuse") for k in state.keys()):
-            net.load_state_dict(state)
-        elif isinstance(state, dict) and "model" in state:
-            net.load_state_dict(state["model"])
-        else:
-            # Unexpected structure, try direct
-            net.load_state_dict(state)
-    except TypeError:
-        # Older PyTorch without weights_only
-        state = torch.load(ckpt_path, map_location=device)
-        net.load_state_dict(state["model"])  # our saved format
+        raw = torch.load(ckpt_path, map_location=device)
+    except Exception as ex:
+        console.log(f"error: failed to load checkpoint {ckpt_path}: {ex}")
+        raise
+    if isinstance(raw, dict) and "model" in raw:
+        sd = raw["model"]
+        saved_mode = raw.get("mode", None)
+    else:
+        sd = raw
+        saved_mode = None
+    if saved_mode and saved_mode != mode:
+        console.log(f"note: checkpoint mode={saved_mode}, eval mode={mode}; loading overlapping weights")
+    model_sd = net.state_dict()
+    filtered = {k: v for k, v in sd.items() if k in model_sd and model_sd[k].shape == v.shape}
+    missing_unexp = net.load_state_dict(filtered, strict=False)
+    try:
+        mk = list(missing_unexp.missing_keys)
+        uk = list(missing_unexp.unexpected_keys)
+        if uk:
+            console.log(f"ignored unexpected keys: {len(uk)}")
+        if mk:
+            console.log(f"missing keys after load: {len(mk)}")
+    except Exception:
+        pass
 
     # loop
     losses = []
     mets = []
     for i, b in enumerate(dl_test):
         b = to_device(b, device)
+        if use_channels_last and isinstance(b.get("patch"), torch.Tensor):
+            b["patch"] = b["patch"].contiguous(memory_format=torch.channels_last)
         out = net(b["patch"], b["state"], b.get("prev_vib"))
         L = compute_losses(mode, b, out, params)
         M = eval_metrics(mode, b, out)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Tuple, Optional, Dict
 import math
 import torch
 import torch.nn.functional as F
@@ -8,6 +8,20 @@ import torch.nn.functional as F
 
 def time_mse(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return F.mse_loss(y_hat, y)
+
+
+# ------------------------------ Small caches for windows/filters ------------------------------
+_hann_cache: Dict[Tuple[int, str, torch.dtype], torch.Tensor] = {}
+_mel_cache: Dict[Tuple[int, int, int, float, float, str, torch.dtype], torch.Tensor] = {}
+
+
+def get_hann_window(win_length: int, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    key = (int(win_length), str(device), dtype)
+    w = _hann_cache.get(key)
+    if w is None or w.device != device or w.dtype != dtype or w.numel() != int(win_length):
+        w = torch.hann_window(int(win_length), device=device, dtype=dtype)
+        _hann_cache[key] = w
+    return w
 
 
 def _stft_mag(y: torch.Tensor, n_fft: int = 256, hop: int = 64, win_length: int = 256) -> torch.Tensor:
@@ -22,7 +36,7 @@ def _stft_mag(y: torch.Tensor, n_fft: int = 256, hop: int = 64, win_length: int 
     win_eff = min(win_length, n_fft_eff, T)
     hop_eff = max(1, min(hop, max(1, win_eff // 2)))
     center = T >= win_eff
-    window = torch.hann_window(win_eff, device=y.device)
+    window = get_hann_window(win_eff, device=y.device, dtype=y.dtype)
     Y = torch.stft(y, n_fft=n_fft_eff, hop_length=hop_eff, win_length=win_eff, window=window, return_complex=True, center=center)
     mag = torch.abs(Y) + 1e-8
     return mag
@@ -38,40 +52,56 @@ def stft_loss(y_hat: torch.Tensor, y: torch.Tensor, n_fft: int = 256, hop: int =
     return F.l1_loss(m_hat, m)
 
 
-def _mel_filterbank(sr: int, n_fft: int, n_mels: int, fmin: float = 0.0, fmax: Optional[float] = None) -> torch.Tensor:
-    """Create a mel filterbank matrix (n_mels, n_fft//2+1) without librosa.
-    Returns torch float32 on CPU; caller moves to device.
-    """
+def _mel_filterbank(
+    sr: int,
+    n_fft: int,
+    n_mels: int,
+    fmin: float = 0.0,
+    fmax: Optional[float] = None,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Create/cached mel filterbank matrix (n_mels, n_fft//2+1) without librosa."""
     if fmax is None:
         fmax = sr / 2
+    dev = device if device is not None else torch.device("cpu")
+    key = (int(sr), int(n_fft), int(n_mels), float(fmin), float(fmax), str(dev), dtype)
+    fb = _mel_cache.get(key)
+    if fb is not None:
+        return fb
     def hz_to_mel(f):
         return 2595.0 * math.log10(1.0 + f / 700.0)
     def mel_to_hz(m):
         return 700.0 * (10 ** (m / 2595.0) - 1.0)
     m_min = hz_to_mel(fmin)
     m_max = hz_to_mel(fmax)
+    # build on CPU float32, then move/cast once to target device/dtype
     m_pts = torch.linspace(m_min, m_max, n_mels + 2)
     f_pts = mel_to_hz(m_pts)
     bins = torch.floor((n_fft + 1) * f_pts / sr).long()
-    fb = torch.zeros(n_mels, n_fft // 2 + 1, dtype=torch.float32)
+    fb_cpu = torch.zeros(n_mels, n_fft // 2 + 1, dtype=torch.float32)
     for i in range(n_mels):
         l, c, r = bins[i].item(), bins[i+1].item(), bins[i+2].item()
         if c == l: c += 1
         if r == c: r += 1
-        fb[i, l:c] = torch.linspace(0, 1, c - l, dtype=torch.float32)
-        fb[i, c:r] = torch.linspace(1, 0, r - c, dtype=torch.float32)
+        if c > l:
+            fb_cpu[i, l:c] = torch.linspace(0, 1, c - l, dtype=torch.float32)
+        if r > c:
+            fb_cpu[i, c:r] = torch.linspace(1, 0, r - c, dtype=torch.float32)
+    fb = fb_cpu.to(device=dev, dtype=dtype)
+    _mel_cache[key] = fb
     return fb
 
 
 def mel_loss_audio(y_hat: torch.Tensor, y: torch.Tensor, sr: int = 8000, n_mels: int = 64, n_fft: int = 512, hop: int = 128) -> torch.Tensor:
     """Mel-spectrogram L1 on log-magnitude mels (no external deps)."""
-    window = torch.hann_window(n_fft, device=y.device)
+    window = get_hann_window(n_fft, device=y.device, dtype=y.dtype)
     def spec(x):
         X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=n_fft, window=window, return_complex=True)
         return torch.abs(X).transpose(1, 2)  # (B, T, F)
     S_hat = spec(y_hat)
     S = spec(y)
-    M = _mel_filterbank(sr=sr, n_fft=n_fft, n_mels=n_mels).to(S.device)
+    M = _mel_filterbank(sr=sr, n_fft=n_fft, n_mels=n_mels, device=S.device, dtype=S.dtype)
     mel_hat = S_hat @ M.T
     mel = S @ M.T
     mel_hat = torch.log(mel_hat + 1e-8)
@@ -84,7 +114,7 @@ def _env(x: torch.Tensor, sr: int, win_ms: float = 25.0) -> torch.Tensor:
     x = torch.abs(x)
     win = int(round(sr * (win_ms / 1000.0)))
     win = max(3, win | 1)
-    w = torch.hann_window(win, device=x.device)
+    w = get_hann_window(win, device=x.device, dtype=x.dtype)
     w = w / w.sum()
     pad = win // 2
     x = F.pad(x.unsqueeze(1), (pad, pad), mode="reflect")

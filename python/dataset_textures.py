@@ -379,6 +379,10 @@ def main():
     p = argparse.ArgumentParser(description="VisuoTactileDataset sanity inspection")
     p.add_argument("--data", type=str, required=True, help="Path to parquet/h5 table")
     p.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
+    p.add_argument("--inspect", type=int, default=64)
+    p.add_argument("--out", type=str, default="assets/debug_samples")
+    args = p.parse_args()
+    sys.exit(_cli_inspect(args))
 def _load_image_gray_arr(img_path: Path) -> np.ndarray:
     with Image.open(img_path) as im:
         im = im.convert("L")
@@ -395,10 +399,6 @@ def _crop_from_arr_wrap(arr: np.ndarray, u: float, v: float, patch: int) -> np.n
     xs = np.mod(xs, W)
     ys = np.mod(ys, H)
     return arr[np.ix_(ys, xs)].astype(np.float32)
-    p.add_argument("--inspect", type=int, default=64)
-    p.add_argument("--out", type=str, default="assets/debug_samples")
-    args = p.parse_args()
-    sys.exit(_cli_inspect(args))
 
 
 if __name__ == "__main__":

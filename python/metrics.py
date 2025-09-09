@@ -4,6 +4,7 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
+from .losses import get_hann_window
 
 
 # ------------------------------ Torch ops ------------------------------
@@ -23,7 +24,7 @@ def lsd_torch(y_hat: torch.Tensor, y: torch.Tensor, n_fft: int = 256, hop: int =
         win_eff = min(n_fft_eff, t_eff)
         hop_eff = max(1, min(hop, max(1, win_eff // 2)))
         center = T >= win_eff
-        window = torch.hann_window(win_eff, device=x.device)
+        window = get_hann_window(win_eff, device=x.device, dtype=x.dtype)
         X = torch.stft(x, n_fft=n_fft_eff, hop_length=hop_eff, win_length=win_eff, window=window, return_complex=True, center=center)
         mag = torch.abs(X) + eps
         db = 20.0 * torch.log10(mag)
@@ -34,7 +35,7 @@ def lsd_torch(y_hat: torch.Tensor, y: torch.Tensor, n_fft: int = 256, hop: int =
 
 
 def spectral_centroid_torch(y: torch.Tensor, sr: int = 1000, n_fft: int = 256, hop: int = 64, eps: float = 1e-8) -> torch.Tensor:
-    window = torch.hann_window(n_fft, device=y.device)
+    window = get_hann_window(n_fft, device=y.device, dtype=y.dtype)
     X = torch.stft(y, n_fft=n_fft, hop_length=hop, win_length=n_fft, window=window, return_complex=True)
     mag = torch.abs(X) + eps
     freqs = torch.linspace(0, sr / 2, steps=mag.shape[1], device=y.device).view(1, -1, 1)
