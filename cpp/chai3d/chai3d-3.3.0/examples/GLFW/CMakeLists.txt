@@ -48,7 +48,7 @@ foreach (example 00-mtp2 01-mydevice 02-multi-devices 03-analytics 04-shapes 05-
 
     file (GLOB source ${example}/*.cpp)
     add_executable (${example} ${source})
-    target_link_libraries (${example} ${CHAI3D_LIBRARIES} ${GLFW_LIBRARIES})
+    target_link_libraries(${example} PRIVATE ${CHAI3D_LIBRARIES} ${GLFW_LIBRARIES})
 
     # Link ONNX Runtime only for our custom example
     if ("${example}" STREQUAL "00-mtp2")
