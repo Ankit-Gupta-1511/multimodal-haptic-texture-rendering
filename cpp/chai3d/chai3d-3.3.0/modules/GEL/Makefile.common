@@ -1,0 +1,130 @@
+################################################################################
+#
+#  Software License Agreement (BSD License)
+#  Copyright (c) 2003-2024, CHAI3D
+#  (www.chai3d.org)
+#
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#
+#  * Redistributions of source code must retain the above copyright
+#  notice, this list of conditions and the following disclaimer.
+#
+#  * Redistributions in binary form must reproduce the above
+#  copyright notice, this list of conditions and the following
+#  disclaimer in the documentation and/or other materials provided
+#  with the distribution.
+#
+#  * Neither the name of CHAI3D nor the names of its contributors may
+#  be used to endorse or promote products derived from this software
+#  without specific prior written permission.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+#  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+#  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+#  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+#  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+#  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+#  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+#  LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+#  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+#  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+#  ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+#  POSSIBILITY OF SUCH DAMAGE.
+#
+################################################################################
+
+# DO NOT MODIFY THIS FILE
+# Project-specific changes should go in Makefile.project(.*).
+
+# Helper functions
+rwildcard=$(foreach d,$(wildcard $1*),$(call rwildcard,$d/,$2) $(filter $(subst *,%,$2),$d))
+
+# Version
+VERSION    = $(TOP_DIR)/project
+PROJECT    = $(shell cat $(VERSION) | grep PROJECT\=    | awk 'BEGIN { FS = "=" } { print $$2 }' )
+MAJOR      = $(shell cat $(VERSION) | grep MAJOR\=      | awk 'BEGIN { FS = "=" } { print $$2 }' )
+MINOR      = $(shell cat $(VERSION) | grep MINOR\=      | awk 'BEGIN { FS = "=" } { print $$2 }' )
+PATCH      = $(shell cat $(VERSION) | grep PATCH\=      | awk 'BEGIN { FS = "=" } { print $$2 }' )
+PRERELEASE = $(shell cat $(VERSION) | grep PRERELEASE\= | awk 'BEGIN { FS = "=" } { print $$2 }' )
+
+# Determine the build configuration.
+ifneq ($(CFG),debug)
+    CFG = release
+endif
+
+# Determine the platform.
+ARCH   ?= $(shell echo `uname -m`)
+SYSTEM ?= $(shell echo `uname -s`)
+ifeq ($(SYSTEM), Linux)
+    OS = lin
+endif
+ifeq ($(SYSTEM), Darwin)
+    OS = mac
+endif
+ifeq ($(SYSTEM), QNX)
+    OS   = qnx
+    ARCH = $(subst pc,,$(ARCH))
+endif
+
+# Common paths
+BIN_DIR = $(TOP_DIR)/bin
+LIB_DIR = $(TOP_DIR)/lib/$(CFG)/$(OS)-$(ARCH)-$(COMPILER)
+INC_DIR = $(TOP_DIR)/include
+
+# Common compiler flags
+CFLAGS   += -I$(INC_DIR) -fsigned-char
+CXXFLAGS += -I$(INC_DIR) -fsigned-char
+
+# Target library headers
+LIB_INCLUDES = $(call rwildcard,$(INC_DIR)/,*.h *.hh *.hpp *.hxx)
+
+# Check for target library source files.
+BUILD_LIB = $(words $(call rwildcard,$(TOP_DIR)/src,*.c *.cc *.cpp))
+
+# Define static library target if required.
+ifneq (0,$(BUILD_LIB))
+    LIB_ROOT_NAME = $(PROJECT)
+    LIB_STATIC = $(LIB_DIR)/lib$(LIB_ROOT_NAME).a
+    LDFLAGS += -L$(LIB_DIR)
+    LDLIBS += -l$(LIB_ROOT_NAME)
+endif
+
+# Common librarian flags
+ARFLAGS = rs
+
+# Build configuration specific flags
+ifneq ($(CFG),debug)
+    CFLAGS   += -O3
+    CXXFLAGS += -O3
+else
+    CFLAGS   += -O0 -g -DDEBUG -Wall -Wextra -Wshadow -Wpointer-arith -Wcast-qual
+    CXXFLAGS += -O0 -g -DDEBUG -Wall -Wextra -Wshadow -Wpointer-arith -Wcast-qual
+endif
+
+# Optional build flags
+ifneq ($(OPTIONS), )
+    CFLAGS   += $(OPTIONS)
+    CXXFLAGS += $(OPTIONS)
+endif
+
+# Library files (include both static and platform-specific shared library files)
+LIB = $(LIB_STATIC) $(LIB_SHARED)
+
+# Import common platform-specific settings.
+ifneq (,$(wildcard $(TOP_DIR)/Makefile.common.$(OS)))
+    include $(TOP_DIR)/Makefile.common.$(OS)
+endif
+
+# Import project settings.
+ifneq (,$(wildcard $(TOP_DIR)/Makefile.project.common))
+    include $(TOP_DIR)/Makefile.project.common
+endif
+
+# Import platform-specific project settings.
+ifneq (,$(wildcard $(TOP_DIR)/Makefile.project.common.$(OS)))
+    include $(TOP_DIR)/Makefile.project.common.$(OS)
+endif

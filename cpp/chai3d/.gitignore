@@ -1,0 +1,55 @@
+# Ignore CHAI3D SDK drops, archives, and build outputs in this folder
+
+# SDK archives and extracted folders
+chai3d-*/build
+chai3d-*/bin
+CHAI3D-*/build
+CHAI3D-*/bin
+CHAI3D-*/doc
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+
+# Build trees
+build/
+build-*/
+bin/
+lib/
+obj/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+compile_commands.json
+
+# Visual Studio / Xcode
+.vs/
+*.sln
+*.suo
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+
+# Binaries and libraries
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.a
+*.so
+*.dylib
+*.o
+*.obj
+
+# Misc
+*.log
+*.tmp
