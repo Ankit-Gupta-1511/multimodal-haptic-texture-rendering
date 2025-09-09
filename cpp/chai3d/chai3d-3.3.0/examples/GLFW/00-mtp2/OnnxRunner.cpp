@@ -73,7 +73,13 @@ OnnxRunner::OnnxRunner(const std::string& modelPath) : impl_(new Impl()) {
     if (!mpath.empty() && FileExists(mpath)) {
         try {
             impl_->opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+            // ORT uses wide strings for paths on Windows
+            #if defined(_WIN32) || defined(_WIN64)
+            std::wstring wpath(mpath.begin(), mpath.end());
+            impl_->session = std::make_unique<Ort::Session>(impl_->env, wpath.c_str(), impl_->opts);
+            #else
             impl_->session = std::make_unique<Ort::Session>(impl_->env, mpath.c_str(), impl_->opts);
+            #endif
             impl_->ready = true;
         } catch (const std::exception& e) {
             std::cerr << "OnnxRunner: failed to create session: " << e.what() << std::endl;
@@ -129,12 +135,12 @@ bool OnnxRunner::runDummy(std::vector<int64_t>& vibShape, std::vector<int64_t>& 
         auto outs = impl_->session->Run(Ort::RunOptions{nullptr}, namesIn.data(), valsIn.data(), (size_t)namesIn.size(), outNames.data(), (size_t)outNames.size());
         // Read shapes
         auto& vib = outs[0];
-        auto* vibInfo = vib.GetTensorTypeAndShapeInfo();
-        vibShape = vibInfo->GetShape();
+        Ort::TensorTypeAndShapeInfo vibInfo = vib.GetTensorTypeAndShapeInfo();
+        vibShape = vibInfo.GetShape();
         if (impl_->has_audio && outs.size() > 1) {
             auto& aud = outs[1];
-            auto* audInfo = aud.GetTensorTypeAndShapeInfo();
-            audShape = audInfo->GetShape();
+            Ort::TensorTypeAndShapeInfo audInfo = aud.GetTensorTypeAndShapeInfo();
+            audShape = audInfo.GetShape();
         }
         return true;
     } catch (const std::exception& e) {
@@ -151,7 +157,7 @@ void OnnxRunner::SelfTest() {
 #ifdef HAS_ORT
               << "HAS_ORT, "
 #else
-              << "NO_ORt, "
+              << "NO_ORT, "
 #endif
               << "attempting to load assets/model.onnx" << std::endl;
     OnnxRunner R;
@@ -166,4 +172,3 @@ void OnnxRunner::SelfTest() {
         std::cout << "[OnnxRunner] runDummy failed." << std::endl;
     }
 }
-
