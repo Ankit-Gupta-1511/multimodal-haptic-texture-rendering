@@ -40,12 +40,41 @@
 # Common settings required to build examples
 include_directories (${GLFW_INCLUDE_DIRS})
 
+# Optional path to ONNX Runtime SDK (C++). Set to folder containing include/ and lib/.
+set(ORT_DIR "D:\\work\\vcpkg\\installed\\x64-windows" CACHE PATH "Path to ONNX Runtime SDK root (contains include/ and lib/)" )
+
 # Build all targets.
 foreach (example 00-mtp2 01-mydevice 02-multi-devices 03-analytics 04-shapes 05-fonts 06-images 07-mouse-select 08-shaders 09-magnets 10-oring 11-effects 12-polygons 13-primitives 14-textures 15-paint 16-friction 17-shading 18-endoscope 19-space 20-map 21-object 22-chrome 23-tooth 24-turntable 25-sounds 26-video 27-multiframes 28-voxel-basic 29-voxel-isosurface 30-voxel-colormap 31-pointcloud)
 
     file (GLOB source ${example}/*.cpp)
     add_executable (${example} ${source})
     target_link_libraries (${example} ${CHAI3D_LIBRARIES} ${GLFW_LIBRARIES})
+
+    # Link ONNX Runtime only for our custom example
+    if ("${example}" STREQUAL "00-mtp2")
+        if (ORT_DIR AND EXISTS "${ORT_DIR}/include/onnxruntime_cxx_api.h")
+            target_include_directories(${example} PRIVATE ${ORT_DIR}/include)
+            if (WIN32)
+                # Try common Windows lib locations
+                find_library(ORT_LIB NAMES onnxruntime PATHS
+                    "${ORT_DIR}/lib"
+                    "${ORT_DIR}/lib/Release"
+                    "${ORT_DIR}/build/Windows/Release"
+                    NO_DEFAULT_PATH)
+            else()
+                find_library(ORT_LIB NAMES onnxruntime PATHS "${ORT_DIR}/lib" "${ORT_DIR}/lib64")
+            endif()
+            if (ORT_LIB)
+                message(STATUS "Linking ONNX Runtime: ${ORT_LIB}")
+                target_link_libraries(${example} PRIVATE ${ORT_LIB})
+                target_compile_definitions(${example} PRIVATE HAS_ORT=1)
+            else()
+                message(WARNING "ONNX Runtime library not found in ORT_DIR; building 00-mtp2 without ORT")
+            endif()
+        else()
+            message(STATUS "ORT_DIR not set or headers missing; building 00-mtp2 without ORT")
+        endif()
+    endif()
   
     # OS specific adjustments
     if (${CMAKE_SYSTEM_NAME} MATCHES Darwin)

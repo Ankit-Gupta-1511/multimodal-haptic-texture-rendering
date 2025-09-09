@@ -43,6 +43,7 @@
 
 //------------------------------------------------------------------------------
 #include "chai3d.h"
+#include "OnnxRunner.h"
 //------------------------------------------------------------------------------
 #include <GLFW/glfw3.h>
 //------------------------------------------------------------------------------
@@ -215,6 +216,9 @@ int main(int argc, char* argv[])
     cout << "[m] - Enable/Disable vertical mirroring" << endl;
     cout << "[q] - Exit application" << endl;
     cout << endl << endl;
+
+    // Tiny ONNX self-test (prints shapes if model + ORT available)
+    OnnxRunner::SelfTest();
 
 
     //--------------------------------------------------------------------------
@@ -579,6 +583,13 @@ void onKeyCallback(GLFWwindow* a_window, int a_key, int a_scancode, int a_action
     {
         mirroredDisplay = !mirroredDisplay;
         camera->setMirrorVertical(mirroredDisplay);
+    }
+
+    // option - run self-test (prints model shapes)
+    else if (a_key == GLFW_KEY_O)
+    {
+        cout << "> ONNX self-test...\n";
+        OnnxRunner::SelfTest();
     }
 }
 
